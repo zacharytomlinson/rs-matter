@@ -72,7 +72,7 @@ fn main() -> Result<(), Error> {
     let kv = matter.kv(store);
 
     // Re-hydrate the `Matter` instance (fabrics, ACLs, basic info).
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
+    matter.startup(&kv)?;
 
     // Create the crypto instance
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
@@ -96,6 +96,10 @@ fn main() -> Result<(), Error> {
         &state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state and deliver the `Startup` lifecycle op to all cluster handlers.
+    futures_lite::future::block_on(im.startup())?;
+
     // Create a default responder capable of handling up to 3 subscriptions
     // All other subscription requests will be turned down with "resource exhausted"
     let responder = DefaultResponder::new(&im);
@@ -114,7 +118,7 @@ fn main() -> Result<(), Error> {
     let mut mdns = pin!(mdns::run_mdns(&matter, &crypto));
     let mut transport = pin!(matter.run(&crypto, &socket, &socket, &socket));
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         // If the device is not commissioned yet, print the QR text and code to the console
         // and enable basic commissioning
 

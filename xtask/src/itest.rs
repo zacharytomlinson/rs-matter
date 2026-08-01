@@ -19,14 +19,22 @@
 
 use core::iter::once;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 use clap::ValueEnum;
 
 use log::{debug, info, warn};
 
-use crate::common::{run_command, ChipBuilder};
+use self::ble_env::BleEnv;
+use self::common::{run_command, ChipBuilder};
+use self::otbr_env::OtbrEnv;
+
+pub(crate) mod ble_env;
+pub(crate) mod common;
+pub(crate) mod otbr_env;
 
 /// System cluster tests + general Matter protocol/IM/SC tests.
 ///
@@ -58,8 +66,17 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     "TestConfigVariables",
     "TestConstraints",
     "TestDelayCommands",
-    // "TestDescriptorCluster", // TODO: Assumes a Power Source device type and expects a lot of clusters to be there
+    // "TestDescriptorCluster", // Skipped: hardcodes upstream `all-clusters-app`'s exact EP0 shape. The Power Source device-type half is now satisfiable (DEV_TYPE_POWER_SOURCE + the PowerSource cluster exist), but it also requires `ServerList` to contain FaultInjection (0xFFF1FC06, a chip test cluster), `PartsList == [1,2,3,4]` (four child endpoints) and an exact EP0 `TagList` — mirroring all-clusters-app rather than testing conformance.
     "TestDiagnosticLogs",
+    // Skipped: every Ethernet Network Diagnostics attribute (PHYRate ..
+    // TimeSinceReset) is optional and `ResetCounts` is its only command, while
+    // `eth_diag::EthDiagHandler` declares `with_attrs(with!(required))` and
+    // `with_cmds(with!())` - so it serves the global attributes and nothing
+    // else. Both tests read the optional attributes under PICS gates, so
+    // enabling them requires the handler to source real interface counters;
+    // claiming them in the `.pics` without that just buys a vacuous pass.
+    // "Test_TC_DGETH_2_1",
+    // "Test_TC_DGETH_2_2",
     "TestDiscovery",
     "TestEqualities",
     "TestEvents",
@@ -69,21 +86,52 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     "TestGroupMessaging",
     "TestGroupsCluster",
     "TestGroupKeyManagementCluster",
+    // Certification variants of the Groups / GroupKeyManagement suites
+    // (the `Test_TC_*` YAMLs the CSA Test Harness runs, stricter than the
+    // functional `Test*Cluster` suites above). The remaining cert YAMLs in
+    // this area - `Test_TC_G_2_3`, `Test_TC_G_3_2`, `Test_TC_GRPKEY_5_4`
+    // and `Test_TC_BIND_2_1/2_2/2_3` - are manual procedures (every step
+    // is `disabled: true`, DUT-as-client or operator-driven), so enabling
+    // them here would only buy a vacuous pass.
+    "Test_TC_G_2_1",
+    "Test_TC_G_2_4",
+    "Test_TC_GRPKEY_2_1",
+    "Test_TC_GRPKEY_2_2",
     "TestIdentifyCluster",
     "TestLogCommands",
     "TestMultiAdmin",
     "TestOperationalCredentialsCluster",
     // "TestOperationalState", // TODO: Operational State cluster not yet implemented
     "TestReadNoneSubscribeNone",
-    // "TestSaveAs", // TODO: not yet verified
+    // `nullable_boolean` must default to `false` (not null) per the upstream
+    // test-cluster XML - see the note in `unit_testing.rs`; everything else
+    // passed as-is on first verification.
+    // Dedicated PowerSource attribute test. Targets the EP1 instance (the
+    // YAML's `config.endpoint: 1` is not overridable by the harness); the
+    // battery-attribute steps are skipped via the `PS.S.*=0` PICS entries.
+    "Test_TC_PS_2_1",
+    "TestSaveAs",
     "TestSelfFabricRemoval",
     "TestSubscribe_AdministratorCommissioning",
     "TestSubscribe_OnOff",
-    // "TestSystemCommands", // TODO: Error attempting to start secondary device
+    // Starts/stops/restarts the DUT via the harness's SystemCommands pseudo
+    // cluster, then spawns a *second* accessory from the `lock` app slot and
+    // commissions it. The DUT binary is registered under `lock:` as well (see
+    // `yaml_test_command`) so that second instance is just another
+    // `system_tests`.
+    "TestSystemCommands",
     "TestUserLabelCluster",
     "TestUserLabelClusterConstraints",
-    // "TestTimeSynchronization", // Skipped: TimeSynchronization cluster not implemented by rs-matter (optional, Matter spec §11.16).
-    // "TestIcdManagementCluster", // Skipped: ICD Management cluster not implemented (rs-matter doesn't ship Intermittently Connected Device support).
+    // SetTimeZone / SetDSTOffset constraint checking against the `TimeZone`
+    // (F00) feature, served by `time_sync::TimeZoneStore`.
+    "TestTimeSynchronization",
+    // End-to-end LIT-ICD lifecycle: the runner commissions with
+    // `--icd-registration true` (this DUT is routed into the `lit-icd` app
+    // slot, see `yaml_test_command`), so the commissioner registers itself as a
+    // Check-In client; the test then reboots the DUT and verifies the registered
+    // client and the ICDCounter survive (counter resumes one epoch ahead). Also
+    // checks OperatingMode flips LIT→SIT on UnregisterClient.
+    "TestIcdManagementCluster",
     "TestUnitTestingClusterMei",
     //
     // Python tests — Interaction Data Model (general Matter protocol)
@@ -91,7 +139,21 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     "TC_IDM_1_2",
     "TC_IDM_1_4",
     "TC_IDM_2_2",
+    // Batched reads incl. `CapabilityMinima`; targets clusters on the root
+    // endpoint, hence the `--endpoint 0` extra arg.
+    "TC_IDM_2_3",
+    // Write Response Action: statuses for writes to unsupported
+    // endpoints/clusters/attributes.
+    "TC_IDM_3_2",
     "TC_IDM_4_2",
+    // Subscription reporting semantics (KeepSubscriptions, intervals,
+    // wildcards). Uses `setup_class_helper`, so it is routed through the
+    // no-PASE shim like `TC_DeviceBasicComposition` (see
+    // `Self::needs_no_pase_shim`).
+    "TC_IDM_4_3",
+    // Timed Request handling.
+    "TC_IDM_5_2",
+    "TC_IDM_9_1",
     //
     // Python tests — Access Control (system cluster)
     //
@@ -99,13 +161,27 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     "TC_ACE_1_3",
     "TC_ACE_1_4",
     "TC_ACE_1_5",
+    // Group-auth access enforcement over REAL multicast: the TH sends
+    // group-addressed invokes at the DUT and asserts the
+    // `Groupcast.GroupcastTesting` events the (armed) DUT emits about them
+    // — including access grants coming solely from the Groupcast-synthesized
+    // `AuxiliaryACL`. Runs against the `NODE_GROUPCAST` app composition
+    // (see `app_args_override`).
+    "TC_ACE_1_6",
     "TC_ACL_2_2",
-    // "TC_ACL_2_3", // Skipped: tests the optional `AccessControlExtension` feature (Extension attribute), not implemented by rs-matter.
+    // TC_ACL_2_3/2_5/2_7 test the optional `AccessControlExtension` feature
+    // (Extension attribute), which rs-matter does not implement:
+    // `@run_if_endpoint_matches(has_attribute(AccessControl.Extension))` skips
+    // them cleanly (converted to a pass via `no_fail_on_skipped.py` — see
+    // `needs_no_fail_on_skipped`). Note this is the `EXTENSION` feature, NOT
+    // the `AUXILIARY` feature (AuxiliaryACL attribute) that rs-matter *does*
+    // implement.
+    "TC_ACL_2_3",
     "TC_ACL_2_4",
-    "TC_ACL_2_5", // Tests the optional `AccessControlExtension` feature (Extension attribute) — `@run_if_endpoint_matches(has_attribute(AccessControl.Extension))` skips cleanly via `no_fail_on_skipped.py`.
+    "TC_ACL_2_5",
     "TC_ACL_2_6",
-    // "TC_ACL_2_7", // Skipped: tests the optional `AccessControlExtension` feature (Extension attribute), not implemented by rs-matter.
-    // "TC_ACL_2_8", // Skipped: the test re-runs itself internally with legacy list encoding after the modern-encoding pass. The Python framework's between-runs controller cleanup is buggy (`object NoneType can't be used in 'await' expression`) and leaves stale fabrics on the DUT, so the second commissioning fails with `Incorrect state`. The modern-encoding pass — including fabric-scoped event filtering — is exercised end-to-end and passes.
+    "TC_ACL_2_7",
+    "TC_ACL_2_8",
     "TC_ACL_2_9",
     "TC_ACL_2_10",
     // "TC_ACL_2_11", // Skipped: tests the provisional `ManagedAclRestrictions` feature (ARL attribute) and requires manufacturer-specific access restrictions to be pre-configured. rs-matter does not implement this feature.
@@ -128,7 +204,11 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     // Python tests — General & Administrator Commissioning (system clusters)
     //
     "TC_CADMIN_1_3_4",
-    // "TC_CADMIN_1_5", // Hits a CHIP-framework cleanup bug we can't patch
+    // The CHIP-framework cleanup bug that used to break this test is another
+    // chip-master-only regression absent from the pinned `v1.6-branch`
+    // framework. Needs the raised timeouts in `per_test_timeout_secs` /
+    // `per_test_framework_timeout_secs` (a ~180s window-expiry wait).
+    "TC_CADMIN_1_5",
     //                  // from the device side. Step 7 (commission after the
     //                  // window has been revoked) expects exactly
     //                  // `CHIP_ERROR_TIMEOUT (0x32)`. To produce 0x32 the
@@ -153,6 +233,9 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //                  // (1_3_4, 1_9, 1_11, 1_15, 1_19, 1_22, 1_25) pass with
     //                  // the silent-drop change.
     "TC_CADMIN_1_9",
+    // Repeated OpenCommissioningWindow / PASE-attempt handling; reads
+    // `SpecificationVersion` on EP0, hence the `--endpoint 0` extra arg.
+    "TC_CADMIN_1_10",
     "TC_CADMIN_1_11",
     "TC_CADMIN_1_15",
     "TC_CADMIN_1_19",
@@ -221,13 +304,12 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //
     // Python tests — Basic Information (system cluster)
     //
-    // The default `BasicInfoHandler` metadata excludes `ConfigurationVersion`
-    // (provisional in Matter 1.5; upstream pulled it from the 1.5 dataset in
-    // CHIP commit faf4d09ad1), so `TestBasicInformation`'s exact-set assertion
-    // on `AttributeList` keeps passing. For `TC_BINFO_3_2` the
+    // The default `BasicInfoHandler` metadata excludes the provisional
+    // `DeviceLocation` attribute, so `TestBasicInformation`'s exact-set
+    // assertion on `AttributeList` keeps passing. For `TC_BINFO_3_2` the
     // `system_tests` binary swaps in an alternate `Node` whose
-    // `BasicInformation` cluster metadata exposes `ConfigurationVersion` — see
-    // `NODE_BINFO_CV_EXPOSED` in `examples/src/bin/system_tests.rs`. The
+    // `BasicInformation` cluster metadata exposes `DeviceLocation` — see
+    // `NODE_BINFO_PROVISIONAL` in `examples/src/bin/system_tests.rs`. The
     // switch is gated on the presence of `--app-pipe` (see `app_args_override`
     // below), which only this test passes.
     "TC_BINFO_3_2",
@@ -236,19 +318,79 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //
     "TC_G_2_2",
     //
+    // Python tests — Groupcast (system cluster, provisional in Matter 1.6)
+    //
+    // The whole `TC_GC_2_x` suite is driven over unicast IM (JoinGroup /
+    // LeaveGroup / UpdateGroupKey / ConfigureAuxiliaryACL /
+    // GroupcastTesting commands plus attribute and event subscriptions);
+    // no real multicast traffic is involved. `TC_GC_2_6` and `TC_GC_2_7`
+    // commission (and later remove) a second test fabric.
+    "TC_GC_2_1",
+    "TC_GC_2_2",
+    "TC_GC_2_3",
+    // "TC_GC_2_4", // Skipped: flaky harness-side timing race, not a DUT bug.
+    // Steps 6-8 do `LeaveGroup(0)` (leave all groups) -> `membership_sub.reset()`
+    // -> await a fresh *empty* `Membership` report. With `min_interval=0` the
+    // DUT correctly emits the empty-`Membership` report the instant the command
+    // is handled (spec: report ASAP), so it reaches the harness in the ~2 ms
+    // between the `LeaveGroup(0)` response and the step-7 `reset()` - which then
+    // discards it. Step 8 then waits the full max interval for another
+    // *data-bearing* report that never comes (membership is stable-empty and
+    // max-interval reports are empty liveness heartbeats), and times out. The
+    // test implicitly assumes reporting is deferred past the reset (as CHIP's
+    // scheduled reporting engine happens to be); rs-matter reports synchronously
+    // and loses the race. No DUT timing change can deterministically win a
+    // wall-clock race against the harness's reset, so re-enable this only once
+    // the reporter defers post-command reports (or the upstream test stops
+    // reset-then-awaiting the same change).
+    "TC_GC_2_5",
+    "TC_GC_2_6",
+    "TC_GC_2_7",
+    "TC_GC_2_8",
+    //
     // Python tests — Network Commissioning (system cluster)
     //
     "TC_CNET_1_4",
-    // "TC_CNET_4_1",  // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_2",  // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_3",  // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_4",  // TODO: Thread network provisioning.
-    // "TC_CNET_4_9",  // TODO: Thread network provisioning.
-    // "TC_CNET_4_10", // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_12", // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_15", // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_16", // TODO: Wi-Fi network provisioning.
-    // "TC_CNET_4_22", // TODO: Thread network provisioning.
+    // The Ethernet variant of the attribute-check test, gated on
+    // `has_feature(kEthernetNetworkInterface)`. `system_tests` claims that
+    // feature (`net_comm::NetworkType::Ethernet` on EP0, `CNET.S.F02` in the
+    // `.pics`), so the test runs rather than skipping.
+    "TC_CNET_4_3",
+    //
+    // The remaining `TC_CNET_4_*` tests target the Wi-Fi (`CNET.S.F00`) and
+    // Thread (`CNET.S.F01`) features. `system_tests` claims neither, so their
+    // `has_feature(...)` decorators / FeatureMap gates skip them. Upstream
+    // lists all of them under `not_automated` in
+    // `src/python_testing/test_metadata.yaml` and runs none of them in CI.
+    //
+    // Most do not actually need a radio, only a DUT that claims the feature
+    // and a `NetCtl` that answers `scan`/`connect` locally — see
+    // `dm::networks::wireless::NoopWirelessNetCtl` for the shape:
+    //   4_1  Wi-Fi   attribute reads only
+    //   4_2  Thread  attribute reads only; needs the network entry to report
+    //                `connected: true`, else the body skips at step 3
+    //   4_4  Wi-Fi   ScanNetworks; the directed-scan SSID is read back from
+    //                the DUT's own `Networks` entry, not supplied as a PIXIT
+    //   4_9  Wi-Fi   RemoveNetwork/ConnectNetwork under an armed failsafe;
+    //                no reboot and no operator prompt anywhere in the body
+    //   4_10 Thread  as 4_9
+    //   4_15 Wi-Fi   NetworkIDNotFound for a bogus network ID; the ID is
+    //                hardcoded in the test, so no PIXIT is needed
+    //   4_16 Thread  as 4_15
+    //   4_22 Thread  ScanNetworks
+    // These need a wireless example binary to run against; they cannot run
+    // against `system_tests`, whose CNET cluster is Ethernet-only.
+    //
+    // `4_12` (Thread ConnectNetwork) is the exception: it moves the DUT
+    // between two live PANs and re-discovers it on each, so a local `NetCtl`
+    // would satisfy it only vacuously. It needs real Thread.
+    //
+    // On the YAML side, `Test_TC_CNET_4_5` / `_4_6` (Wi-Fi / Thread
+    // FAILSAFE_REQUIRED) are four executable commands each and equally
+    // radio-free, while `Test_TC_CNET_4_11` needs two live access points.
+    // `Test_TC_CNET_4_13`, `_4_14`, `_4_20` and `_4_21` carry no executable
+    // steps at all (every step is `disabled: true`) — they are operator
+    // procedures, not runnable tests, and are deliberately not tracked here.
 
     //
     // Python tests — General Diagnostics (system cluster)
@@ -281,28 +423,60 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //   - `F01` (NTP_CLIENT):     2_6
     "TC_TIMESYNC_2_1",
     "TC_TIMESYNC_2_2",
-    // "TC_TIMESYNC_2_4",  // Skipped: needs Feature `F00` (TimeZone) — TimeZone / DSTOffset attribute set + SetTimeZone / SetDSTOffset commands.
-    // "TC_TIMESYNC_2_5",  // Skipped: needs `F00`.
+    // The `TimeZone` (F00) feature set: TimeZone/DSTOffset lists, LocalTime,
+    // SetTimeZone / SetDSTOffset - served by `time_sync::TimeZoneStore` plus
+    // the transition-event timer in the TimeSync handler's `Handler::run`.
+    "TC_TIMESYNC_2_4",
+    "TC_TIMESYNC_2_5",
     // "TC_TIMESYNC_2_6",  // Skipped: needs `F01` (NTP_CLIENT) — DefaultNTP / SupportsDNSResolve + SetDefaultNTP.
-    // "TC_TIMESYNC_2_7",  // Skipped: needs `F00`.
-    // "TC_TIMESYNC_2_8",  // Skipped: needs `F00`.
-    // "TC_TIMESYNC_2_9",  // Skipped: needs `F00`.
-    // "TC_TIMESYNC_2_10", // Skipped: needs `F00`.
-    // "TC_TIMESYNC_2_11", // Skipped: needs `F00`.
-    // "TC_TIMESYNC_2_12", // Skipped: needs `F00`.
+    "TC_TIMESYNC_2_7",
+    "TC_TIMESYNC_2_8",
+    "TC_TIMESYNC_2_9",
+    "TC_TIMESYNC_2_10",
+    // Real-time DST-transition events (DSTStatus at validStarting/validUntil
+    // boundaries, ~40s of scheduled transitions).
+    "TC_TIMESYNC_2_11",
+    // Real-time TimeZoneStatus events at `validAt` boundaries.
+    "TC_TIMESYNC_2_12",
     "TC_TIMESYNC_2_13",
     "TC_TIMESYNC_3_1",
     //
     // Python tests — ICD Management (optional system cluster)
     //
-    // "TC_ICDM_2_1", // Skipped: ICD Management cluster not implemented by rs-matter (Intermittently Connected Devices, optional, Matter spec §9.17).
-    // "TC_ICDM_3_1", // Skipped: ICD Management cluster not implemented by rs-matter.
-    // "TC_ICDM_3_2", // Skipped: ICD Management cluster not implemented by rs-matter.
-    // "TC_ICDM_3_3", // Skipped: ICD Management cluster not implemented by rs-matter.
-    // "TC_ICDM_3_4", // Skipped: ICD Management cluster not implemented by rs-matter.
-    // "TC_ICDM_5_1", // Skipped: ICD Management cluster not implemented by rs-matter.
-    // "TC_ICDManagementCluster", // Skipped: ICD Management cluster not implemented by rs-matter.
-
+    // rs-matter implements the Check-In Protocol (CIP feature): the
+    // RegisterClient / UnregisterClient / StayActiveRequest commands and the
+    // RegisteredClients / ICDCounter / ClientsSupportedPerFabric /
+    // MaximumCheckInBackOff attributes. It is not a Long-Idle-Time ICD (no LITS
+    // feature, no OperatingMode) and does not register clients at commissioning
+    // time. TC_ICDM_2_1 reads and range-checks the attribute surface — it passes
+    // with the PICS claiming only F00.
+    "TC_ICDM_2_1",
+    // Exercises the full register/unregister flow: ResourceExhausted when a
+    // fabric's registration slot is full, NotFound on unknown unregister, and
+    // read-back of the RegisteredClients entries. Steps 2a/2b use the
+    // GeneralDiagnostics `kAddActiveModeReq` ICD trigger, accepted as a no-op by
+    // the `system_tests` DUT (see `app_args_override` for the enable-key).
+    "TC_ICDM_3_1",
+    // Verification-key access control plus a reboot check. The reboot leg is
+    // gated on `not is_ci`; our PICS carries `PICS_SDK_CI_ONLY=1`, so the CI path
+    // runs (register/read-back/verification-key) and skips the physical reboot,
+    // which the harness can't drive. RegisteredClients are still persisted.
+    "TC_ICDM_3_2",
+    "TC_ICDM_3_3",
+    // ICDCounter monotonicity across a reboot. The reboot leg is `not is_ci`;
+    // with `PICS_SDK_CI_ONLY=1` the CI path just reads the counter twice and
+    // asserts it never decreases. The counter is persisted for the real path.
+    "TC_ICDM_3_4",
+    // Operating mode (LITS): reads the OperatingMode attribute and the operational
+    // `ICD` DNS-SD TXT key, asserting both are SIT with no clients, flip to LIT
+    // after RegisterClient, and back to SIT after UnregisterClient. Needs `--PICS`
+    // (the F02 gate) and browses the DUT's operational mDNS.
+    "TC_ICDM_5_1",
+    // Drives the ICD Check-In counter-invalidation TestEventTriggers
+    // (`kInvalidateHalf/AllCounterValues`) and asserts the ICDCounter jumps by
+    // exactly half / all of the u32 range. The DUT applies the jump in place and
+    // persists the new boundary (see `app_args_override` for the enable-key).
+    "TC_ICDManagementCluster",
     //
     // Python tests — Localization clusters (optional)
     //
@@ -314,8 +488,21 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //
     // Python tests — Power Source (optional system cluster)
     //
-    // "TC_PS_2_3", // Skipped: PowerSource cluster not implemented by rs-matter (optional, Matter spec §11.7).
-
+    // PowerSource is hosted (featureless/wired) on EP0 of `system_tests`.
+    // The battery-attribute reporting-rate checks are vacuously satisfied on
+    // a wired source; the wildcard subscription over the cluster is the part
+    // genuinely exercised.
+    "TC_PS_2_3",
+    //
+    // Python tests — Basic Information (system cluster)
+    //
+    // `TC_BINFO_2_1`'s `DeviceLocation` steps 24-28 skip via
+    // `attribute_guard` — deliberately; see the `TC_BINFO_2_1` note in
+    // `app_args_override` for why they cannot be made to run.
+    "TC_BINFO_2_1",
+    "TC_BINFO_2_2",
+    "TC_BINFO_3_1",
+    "TC_DGGEN_2_5",
     //
     // Python tests — Fixed Label (optional system cluster)
     //
@@ -330,15 +517,13 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     // "TC_BRBINFO_4_1", // Skipped: rs-matter does not implement bridge devices.
 
     //
-    // Python tests — Switch (optional application cluster)
-    //
-    "TC_SWTCH", // Switch cluster not implemented (Matter spec §1.13); 5 inner test methods, each `@run_if_endpoint_matches(has_feature(Switch, ...))`, all skip cleanly via `no_fail_on_skipped.py`.
-    //
     // Python tests — Device Attestation (commissioning)
     //
     "TC_DA_1_2",
     "TC_DA_1_5",
     "TC_DA_1_7",
+    // NOC wiped on factory reset.
+    "TC_DA_1_1",
     "TC_DA_1_9",
     //
     // Python tests — Device Discovery (general)
@@ -360,89 +545,43 @@ pub(crate) const SYS_TESTS: &[&str] = &[
     //
     // Python tests — Device Composition / Conformance (general)
     //
-    // "TC_DeviceBasicComposition",
-    //   // Bundles several MatterBaseTests run after a single wildcard read.
-    //   // The `BasicCompositionTests.setup_class_helper()` PASE blocker that
-    //   // hits TC_AccessChecker is already worked around for this test too
-    //   // (added to `Self::needs_no_pase_shim` — re-enable here when the
-    //   // gaps below are closed and the PASE shim already routes setup
-    //   // through `xtask/scripts/no_pase_setup_class_helper.py`). The
-    //   // remaining independent gaps:
-    //   //
-    //   // 1. `test_TC_DESC_2_2` — checks `Descriptor::TagList` /
-    //   //    `EndpointUniqueID` semantic-tag attributes per Matter Core
-    //   //    spec §9.5 to validate tree-composition tagging on every
-    //   //    endpoint. rs-matter's `DescHandler` doesn't yet expose these.
-    //   //
-    //   // 2. `test_TC_IDM_10_1` — performs a wildcard *event* subscribe
-    //   //    across all endpoints/clusters and asserts no failures. Needs
-    //   //    a triage pass over rs-matter's event-subscription surface.
-    //   //
-    //   // 3. The wildcard read also pulls
-    //   //    `UnitTesting::GeneralErrorBoolean` (attr 0x31, returns
-    //   //    `InvalidDataType`) and `UnitTesting::ClusterErrorBoolean`
-    //   //    (0x32, returns `Invalid`) — see `unit_testing.rs:1042-1048`.
-    //   //    They're spec-mandated to error out (test fixtures for cluster
-    //   //    error handling), but `TC_IDM_12_1`'s JSON dump records them as
-    //   //    `49:ERROR` / `50:ERROR` and the surrounding tests treat the
-    //   //    decode failures as device problems.
+    // Bundles several `MatterBaseTest`s run after a single wildcard read.
+    // `BasicCompositionTests.setup_class_helper()`'s PASE leg is routed through
+    // `xtask/scripts/no_pase_setup_class_helper.py` (see
+    // `Self::needs_no_pase_shim`), and the test is handed the target `.pics`
+    // (see `Self::needs_target_pics`) because `test_TC_IDM_10_1` only tolerates
+    // the test-vendor identifiers the example fixtures use when
+    // `PICS_SDK_CI_ONLY` is set.
     //
-    // "TC_DeviceConformance",
-    //   // Runs the upstream device-conformance suite (six sub-tests:
-    //   // `test_TC_DESC_2_3`, `test_TC_IDM_10_2`/`_3`/`_5`/`_6`,
-    //   // `test_TC_IDM_14_1`) after a wildcard read of the full
-    //   // attribute/command surface. The PASE+CASE race in
-    //   // `BasicCompositionTests.setup_class_helper` is already worked
-    //   // around via `Self::needs_no_pase_shim` (which routes setup
-    //   // through `xtask/scripts/no_pase_setup_class_helper.py`), and
-    //   // the suite is invoked with
-    //   // `--bool-arg ignore_in_progress:True allow_provisional:True`
-    //   // plus `--PICS .../ci-pics-values` (see
-    //   // `Self::extra_python_script_args`).
-    //   //
-    //   // Current status: **5 of 6 sub-tests pass**
-    //   //   - DESC_2_3 ✓
-    //   //   - IDM_10_2 ✓ (cleared by `gen_comm.rs:220`'s
-    //   //     `with_cmds(except!(CommandId::SetTCAcknowledgements))` —
-    //   //     drops the TC-feature-gated commands from
-    //   //     `AcceptedCommandList` per Matter Core spec §11.10.5)
-    //   //   - IDM_10_3 ✓
-    //   //   - IDM_10_5 ✗ (the only remaining failure — see below)
-    //   //   - IDM_10_6 ✓ (cleared by bumping `DEV_TYPE_ROOT_NODE.drev`
-    //   //     1→4 and `DEV_TYPE_ON_OFF_LIGHT.drev` 2→3 in
-    //   //     `rs-matter/src/dm/devices.rs`; rev-4 Root Node additions
-    //   //     are all conditional/optional, rev-3 On/Off Light just
-    //   //     swaps deprecated Scenes 0x0005 for Scenes Management
-    //   //     0x0062 — see Device Library §2.1.1 / §4.1.1)
-    //   //   - IDM_14_1 ✓
-    //   //
-    //   // `test_TC_IDM_10_5` (device-type conformance) still fails on
-    //   // two problem entries:
-    //   //
-    //   //   a. **Groups on EP0** (1 problem, deliberate). The
-    //   //      `system_tests` fixture re-adds Groups at root for
-    //   //      the `TestGroupMessaging` YAML test (group-addressed
-    //   //      writes to `BasicInformation::NodeLabel` need EP0 to be
-    //   //      a member of a multicast group, which only works via
-    //   //      per-endpoint Groups membership per App Cluster §1.3).
-    //   //      Matter Core §7.16.4 explicitly permits extra clusters
-    //   //      on an endpoint, but the conformance checker takes a
-    //   //      strict view. See the `NODE` doc comment in
-    //   //      `examples/src/bin/system_tests.rs` for the full
-    //   //      rationale; the library-level `with_*_sys()` chain and
-    //   //      the `g*` macro variants no longer add Groups at root,
-    //   //      so device-type-pure compositions are the *default*.
-    //   //
-    //   //   b. **Scenes Management cluster** missing on EP1/EP2
-    //   //      (2 problems). On/Off Light at rev 3 mandates Scenes
-    //   //      Management (0x0062). This is a substantial new cluster
-    //   //      implementation (multiple commands — `AddScene`,
-    //   //      `ViewScene`, `RemoveScene`, `RemoveAllScenes`,
-    //   //      `StoreScene`, `RecallScene`, `GetSceneMembership`,
-    //   //      `CopyScene` — plus persistent scene-table storage).
-    //   //      Tracked separately as a future workstream.
-    //   //
-    //   // Re-enable once Scenes Management is implemented.
+    // `test_TC_SM_1_1`'s Groupcast conformance block is skipped because the
+    // device declares `SpecificationVersion` 1.6.0 - see
+    // `basic_info::DEFAULT_MATTER_SPEC_VERSION`, which documents why, and what
+    // has to be implemented before that can be raised to 1.6.1.
+    "TC_DeviceBasicComposition",
+    //
+    // Runs the upstream device-conformance suite (six sub-tests:
+    // `test_TC_DESC_2_3`, `test_TC_IDM_10_2`/`_3`/`_5`/`_6`,
+    // `test_TC_IDM_14_1`) after a wildcard read of the full
+    // attribute/command surface. The PASE+CASE race in
+    // `BasicCompositionTests.setup_class_helper` is worked around via
+    // `Self::needs_no_pase_shim`, and the suite is invoked with
+    // `--bool-arg ignore_in_progress:True allow_provisional:True
+    // fail_on_extra_clusters:False` plus the target `.pics` (see
+    // `Self::extra_python_script_args` / `Self::needs_target_pics`).
+    //
+    // `fail_on_extra_clusters:False` is what makes `test_TC_IDM_10_5`
+    // pass with `Groups` deliberately re-added at the root endpoint for
+    // `TestGroupMessaging` (group-addressed writes to
+    // `BasicInformation::NodeLabel` need EP0 to be a group member). Matter
+    // Core spec 7.16.4 permits extra clusters on an endpoint; the
+    // conformance checker takes a stricter view by default, and upstream
+    // provides this flag for exactly that reason - `all-clusters-app` puts
+    // `Groups` on EP0 too.
+    //
+    // This suite is the automated check for revision-conditional
+    // conformance (`Rev >= vN`), which the `.matter` IDL cannot express and
+    // which therefore compiles clean when wrong - keep it enabled.
+    "TC_DeviceConformance",
 ];
 
 /// Camera cluster tests — run against the `camera_tests` example.
@@ -512,6 +651,11 @@ pub(crate) const LIGHT_TESTS: &[&str] = &[
     "Test_TC_CC_9_1",
     "Test_TC_CC_9_2",
     "Test_TC_CC_9_3",
+    // Generic Switch (Python): runs against the `light_tests` Generic
+    // Switch endpoint (EP3, `MS | MSR | MSL`), with the presses simulated
+    // over the `--app-pipe` channel. The latching (2_2) and multi-press
+    // (2_5 / 2_6) methods skip on the feature gates; 2_3 / 2_4 run.
+    "TC_SWTCH",
 ];
 
 /// Scenes Management YAML tests — run against the `scenes_tests` example.
@@ -544,6 +688,214 @@ pub(crate) const OTA_TESTS: &[&str] = &[
     "OTA_SuccessfulTransfer@requestor",
 ];
 
+/// Network Commissioning tests for the wireless network types — run against the
+/// `wireless_tests` binary, whose `NetCtl` answers `ScanNetworks` /
+/// `ConnectNetwork` from a canned table instead of a radio.
+///
+/// Upstream lists every one of these under `not_automated` in
+/// `src/python_testing/test_metadata.yaml` because `chip-all-clusters-app` binds
+/// the cluster straight to the platform's Wi-Fi / Thread stack, leaving nowhere
+/// to stand in for the radio. The `NetCtl` trait is that seam here.
+///
+/// The Thread entries drive the same binary in its Thread flavour — see
+/// `Self::app_args_override`.
+pub(crate) const WIRELESS_TESTS: &[&str] = &[
+    // Wi-Fi
+    "TC_CNET_4_1",
+    "TC_CNET_4_4",
+    "TC_CNET_4_9",
+    "TC_CNET_4_15",
+    // Thread
+    "TC_CNET_4_2",
+    "TC_CNET_4_10",
+    "TC_CNET_4_16",
+    "TC_CNET_4_22",
+    //
+    // YAML: the provisioning commands must be refused without an armed
+    // failsafe. Four executable commands each, no radio involved.
+    "Test_TC_CNET_4_5",
+    "Test_TC_CNET_4_6",
+    //
+    // YAML: the mandatory Wi-Fi / Thread diagnostics attributes, answered by
+    // `MockNetCtl` from the provisioned network.
+    //
+    // Their siblings stay off because `WifiDiagHandler` / `ThreadDiagHandler`
+    // are `with_attrs(with!(required))` / `with_cmds(with!())`: everything they
+    // gate on is either an optional counter or `ResetCounts`, none of which is
+    // implemented, so they would run no steps at all -
+    //   `Test_TC_DGWIFI_2_3`    counters + ResetCounts
+    //   `Test_TC_DGTHREAD_2_2`  Tx counters (MACCounts)
+    //   `Test_TC_DGTHREAD_2_3`  Rx counters (MACCounts)
+    //   `Test_TC_DGTHREAD_2_4`  OverrunCount + ResetCounts
+    // Enabling those means implementing the counters first, exactly as for the
+    // Ethernet diagnostics.
+    "Test_TC_DGWIFI_2_1",
+    "Test_TC_DGTHREAD_2_1",
+    //
+    // "TC_CNET_4_12", // Skipped: moves the node between two live PANs and
+    //                 // re-discovers it on each. A canned `NetCtl` reports
+    //                 // success without the node ever moving, so this would go
+    //                 // green without testing anything. Needs real Thread.
+    //
+    // `Test_TC_CNET_4_5` (Wi-Fi) and `Test_TC_CNET_4_6` (Thread) are equally
+    // radio-free — four commands each, checking that the provisioning commands
+    // are rejected without an armed failsafe. They are YAML, so the runner
+    // always hands them `--pics-file <target>.pics`, and they gate on
+    // `CNET.S.F00` / `CNET.S.F01` respectively. One `.pics` per target cannot
+    // claim both, so enabling them needs the Wi-Fi and Thread flavours split
+    // into two `[[bin]]` targets sharing one source file.
+];
+
+/// Which flavour of the `wireless_tests` binary a test drives.
+///
+/// The Wi-Fi and Thread network stores are distinct types, so the binary picks
+/// one at startup; and because the two claim different Network Commissioning
+/// features (`CNET.S.F00` vs `CNET.S.F01`) plus different diagnostics clusters,
+/// they also need different `.pics` files.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WirelessFlavour {
+    Wifi,
+    Thread,
+}
+
+impl WirelessFlavour {
+    /// The flavour a test needs, or `None` if it does not run against
+    /// `wireless_tests` at all.
+    fn of(test_name: &str) -> Option<Self> {
+        let flavour = match test_name {
+            "TC_CNET_4_1" | "TC_CNET_4_4" | "TC_CNET_4_9" | "TC_CNET_4_15" | "Test_TC_CNET_4_5"
+            | "Test_TC_DGWIFI_2_1" | "Test_TC_DGWIFI_2_3" => Self::Wifi,
+            "TC_CNET_4_2"
+            | "TC_CNET_4_10"
+            | "TC_CNET_4_16"
+            | "TC_CNET_4_22"
+            | "Test_TC_CNET_4_6"
+            | "Test_TC_DGTHREAD_2_1"
+            | "Test_TC_DGTHREAD_2_2"
+            | "Test_TC_DGTHREAD_2_3"
+            | "Test_TC_DGTHREAD_2_4" => Self::Thread,
+            _ => return None,
+        };
+
+        Some(flavour)
+    }
+
+    /// The `.pics` basename this flavour declares.
+    fn pics_target(&self) -> &'static str {
+        match self {
+            Self::Wifi => "wireless_tests_wifi",
+            Self::Thread => "wireless_tests_thread",
+        }
+    }
+}
+
+/// Tests re-run with commissioning over **BLE** instead of on-network, against
+/// the `ble_tests` driver.
+///
+/// These add no new certification test names - the point is the transport: the
+/// whole BTP / GATT / BlueZ path plus the non-concurrent provisioning flow
+/// (`AddOrUpdateWiFiNetwork` + `ConnectNetwork` carried over BTP) has no other
+/// automated coverage. `TC_CNET_4_1` is a good vehicle because it then reads
+/// back the network the commissioner actually provisioned, rather than one the
+/// device seeded for itself.
+pub(crate) const BLE_TESTS: &[&str] = &[
+    "TC_CNET_4_1",
+    // The BLE-**Thread** flow, against the `--thread` flavour of `ble_tests`:
+    // same BTP transport, but the provisioned network is a real Thread PAN
+    // (`otbr-agent` joins the mock-Bluetooth bus, radio simulated as in the
+    // `thread` suite). This is the only e2e of the **non-concurrent**
+    // provisioning contract: the DUT answers `ConnectNetwork` over BTP
+    // without touching the radio, then replays the attach via
+    // `InteractionModel::connect_once` once BTP is torn down, and the
+    // commissioner completes commissioning over the operational (UDP)
+    // network. `TC_CNET_4_2` then reads back the genuinely-attached network.
+    "TC_CNET_4_2",
+    // "TC_CNET_4_1@bluer", // Skipped: the `bluer` backend cannot complete BTP
+    //                      // against a BlueZ that confirms indications over the
+    //                      // `AcquireNotify` socket (>= 5.80, and `bluezoo`).
+    //                      // `bluer` exposes that socket as a write-only
+    //                      // `CharacteristicWriter` and never drains the
+    //                      // confirmation byte, so the session stalls after the
+    //                      // first indication - the same defect that
+    //                      // `gatt::bluez::wait_complete` handles on our side,
+    //                      // but inside the crate where we cannot fix it.
+    //                      // The `--bluer` switch and this entry are kept so the
+    //                      // backend can be exercised by hand against an older
+    //                      // BlueZ, and re-enabled once `bluer` reads the
+    //                      // confirmation.
+];
+
+/// The first Thread operational dataset for the `thread` suite — the network
+/// the DUT driver auto-attaches to at startup (handed to it via the
+/// `RS_MATTER_THREAD_DATASET` env var), and the `--thread-dataset-hex` the
+/// Python tests receive.
+///
+/// Layout is exactly what `ot-ctl dataset init new` emits: ActiveTimestamp,
+/// Channel (17), ChannelMask, ExtPANID, NetworkName ("rsm-thread-1"), PSKc,
+/// NetworkKey, MeshLocalPrefix, PanId (0x1234), SecurityPolicy.
+///
+/// NB: the Extended PAN ID deliberately avoids `1111111122222222` - that is
+/// `TC_CNET_4_16`'s hardcoded "unknown second network" ID, which must NOT
+/// match the commissioned network.
+const THREAD_DATASET_1: &str = "0e080000000000010000\
+     0003000011\
+     35060004001fffe0\
+     02081a2b3c4d5e6f7081\
+     030c72736d2d7468726561642d31\
+     0410c3f59368445a1b6106be420a706d4cc9\
+     051000112233445566778899aabbccddeeff\
+     0708fd11111111220000\
+     01021234\
+     0c0402a0f7f8";
+
+/// The second Thread operational dataset (`PIXIT.CNET.THREAD_2ND_OPERATIONALDATASET`):
+/// the network `TC_CNET_4_12` moves the DUT onto and back off of. Distinct
+/// channel (22), ExtPANID, name ("rsm-thread-2"), keys, prefix and PanId
+/// (0xabcd) from [`THREAD_DATASET_1`].
+const THREAD_DATASET_2: &str = "0e080000000000010000\
+     0003000016\
+     35060004001fffe0\
+     02088888888877777777\
+     030c72736d2d7468726561642d32\
+     0410d4e6f8a91b2c3d4e5f60718293a4b5c6\
+     0510ffeeddccbbaa99887766554433221100\
+     0708fd22222222330000\
+     0102abcd\
+     0c0402a0f7f8";
+
+/// Thread tests against a REAL Thread stack: the `thread_tests` driver wired
+/// to `otbr-agent` over D-Bus (see [`crate::otbr_env::OtbrEnv`]), radio
+/// defaulting to OpenThread's simulated RCP. Unlike the `wireless` suite,
+/// `ScanNetworks`/`ConnectNetwork` here actually form and switch PANs.
+pub(crate) const THREAD_TESTS: &[&str] = &[
+    // The mandatory Thread diagnostics attributes, now answered from the live
+    // stack (channel, routing role, neighbor table, ...) instead of a mock.
+    "Test_TC_DGTHREAD_2_1",
+    // The optional MAC Tx / Rx counter attributes (`MACCNT` feature), served
+    // off `otbr-agent`'s MAC counters D-Bus property via
+    // `ThreadDiag::mac_counters`. `Test_TC_DGTHREAD_2_4` stays off: it needs
+    // `ResetCounts`, which the otbr D-Bus API does not expose at all.
+    "Test_TC_DGTHREAD_2_2",
+    "Test_TC_DGTHREAD_2_3",
+    //
+    // The one CNET test that a canned `NetCtl` can only satisfy vacuously
+    // (see the note in `WIRELESS_TESTS`): the DUT moves between two live
+    // PANs. With the simulated radio the DUT genuinely detaches from
+    // `thread_dataset_1` and forms/joins `thread_dataset_2` as its own
+    // partition — `Networks[].connected` reflects the real device role.
+    "TC_CNET_4_12",
+    // Re-runs of the `wireless` suite's Thread CNET set against the real
+    // stack: attribute reads off a genuinely-attached network (4_2),
+    // RemoveNetwork/ConnectNetwork under an armed fail-safe with a real
+    // revert-and-reattach (4_10 — the e2e for the `WirelessMgr` fail-safe
+    // reconnect), and NetworkIDNotFound refusal (4_16). Their
+    // `--thread-dataset-hex` is the suite's real dataset here (see
+    // `extra_python_script_args`); the mock TLV serves the wireless suite.
+    "TC_CNET_4_2",
+    "TC_CNET_4_10",
+    "TC_CNET_4_16",
+];
+
 /// A pre-canned test suite. Selects a default test list, the example
 /// binary they run against, the cargo features it must be built with,
 /// and a per-test timeout suitable for that suite.
@@ -571,6 +923,18 @@ pub(crate) enum TestSuite {
     /// OTA Software Update — `system_tests` plays an rs-matter OTA role against a
     /// CHIP `chip-ota-{provider,requestor}-app` counterpart.
     Ota,
+    /// Network Commissioning for the wireless network types, against the
+    /// `wireless_tests` binary and its canned `NetCtl`. Needs no radio.
+    Wireless,
+    /// Thread tests against a real Thread stack: `otbr-agent` + the
+    /// `thread_tests` driver, on OpenThread's simulated radio by default
+    /// (no hardware needed; set `RS_MATTER_THREAD_RADIO_URL` for a real
+    /// RCP dongle). Local-only for now; requires `sudo` for the TUN
+    /// interface.
+    Thread,
+    /// Commissioning over BLE, against the `ble_tests` driver. Runs on a mock
+    /// BlueZ (`bluezoo`), so it needs no Bluetooth hardware.
+    Ble,
     /// **Inverted** suite — rs-matter as the **commissioner** driving
     /// upstream `chip-all-clusters-app` (the device under test). Builds
     /// both binaries, spawns the CHIP app on `[::1]:<port>` with known
@@ -602,6 +966,9 @@ impl TestSuite {
             Self::Light => LIGHT_TESTS.to_vec(),
             Self::Scenes => SCENES_TESTS.to_vec(),
             Self::Ota => OTA_TESTS.to_vec(),
+            Self::Wireless => WIRELESS_TESTS.to_vec(),
+            Self::Thread => THREAD_TESTS.to_vec(),
+            Self::Ble => BLE_TESTS.to_vec(),
             // One synthetic case — the dispatch in `ITests::run` picks
             // this up and routes to `run_commissioner_suite`, which
             // ignores the test list (there's nothing to parameterise yet).
@@ -618,6 +985,9 @@ impl TestSuite {
             Self::Scenes => "scenes_tests",
             // rs-matter plays its OTA role from the `system_tests` binary.
             Self::Ota => "system_tests",
+            Self::Wireless => "wireless_tests",
+            Self::Thread => THREAD_TARGET,
+            Self::Ble => "ble_tests",
             Self::Commissioner => "commissioner_tests",
         }
     }
@@ -632,7 +1002,14 @@ impl TestSuite {
             | Self::Light
             | Self::Scenes
             | Self::Ota
+            | Self::Wireless
             | Self::Commissioner => &[],
+            // The otbr D-Bus client (`OtbrNetCtl` + the `BorderRouterProxy`)
+            // lives behind `zbus`.
+            Self::Thread => &["zbus"],
+            // The BlueZ GATT peripheral lives behind `zbus`; `bluer` adds the
+            // alternative backend, selected per-test with `--bluer`.
+            Self::Ble => &["ble", "bluer"],
         }
     }
 
@@ -648,6 +1025,12 @@ impl TestSuite {
             // A full OTA flow commissions two nodes and transfers an image over
             // BDX; give it headroom.
             Self::Ota => 300,
+            Self::Wireless => 120,
+            // Real (if simulated-radio) Thread attaches: PAN formation plus
+            // the `ConnectMaxTimeSeconds + fudge` settling waits.
+            Self::Thread => 300,
+            // BLE discovery plus the BTP handshake are slower than plain UDP.
+            Self::Ble => 300,
             Self::Commissioner => 120,
         }
     }
@@ -655,6 +1038,18 @@ impl TestSuite {
 
 /// The directory where the Chip repository will be cloned
 const CHIP_DIR: &str = ".build/itest/connectedhomeip";
+
+/// The `--target` whose tests are commissioned over BLE.
+const BLE_TARGET: &str = "ble_tests";
+
+/// The `--target` whose tests run against a real Thread stack (`otbr-agent`,
+/// stood up by [`OtbrEnv`]). Its driver receives the startup dataset via the
+/// `RS_MATTER_THREAD_DATASET` env var.
+const THREAD_TARGET: &str = "thread_tests";
+
+/// The workspace crate holding the device-under-test drivers (`*_tests`
+/// binaries) and their `.pics` files.
+const TEST_CRATE_DIR: &str = "tests";
 
 /// Synthetic test name surfaced for [`TestSuite::Commissioner`] — picked
 /// up by [`ITests::run_tests`] and routed to [`ITests::run_commissioner_suite`].
@@ -719,7 +1114,14 @@ impl ITests {
             .build_chip_tool(chip_gitref, force_rebuild)?;
         // Required so that `TC_*` Python tests can be dispatched via
         // `scripts/tests/run_python_test.py`.
-        self.chip_builder.build_python_wheel(force_rebuild)
+        self.chip_builder.build_python_wheel(force_rebuild)?;
+        // The `thread` suite's Thread stack (`otbr-agent` + the simulation
+        // `ot-rcp`). Built here - and not only lazily by the suite itself -
+        // so that in CI the artifacts end up in the Chip build cache: the
+        // cache is saved by a different matrix leg (`system-python`) than the
+        // one running the thread suite (`rest`), and a lazily-built tree
+        // would be rebuilt on every run without ever being saved.
+        self.chip_builder.build_otbr(chip_gitref, force_rebuild)
     }
 
     /// Build the executable (`system-tests`) that is to be tested with the Chip integration tests.
@@ -773,7 +1175,7 @@ impl ITests {
             return self.run_commissioner_suite(test_timeout_secs, profile, target);
         }
 
-        let chip_tool_path = chip_dir.join("out/host/chip-tool");
+        let chip_tool_path = self.chip_builder.chip_tool_path();
         if !chip_tool_path.exists() {
             anyhow::bail!("`chip-tool` not found. Run `cargo xtask itest-setup` first.");
         }
@@ -813,9 +1215,73 @@ impl ITests {
             self.chip_builder.build_chip_ota_provider_app(None, false)?;
         }
 
-        // Run each test
-        for test_name in tests {
-            self.run_test(test_name, test_timeout_secs, profile, target)?;
+        // The thread suite's DUT-side Thread stack is `otbr-agent` plus (by
+        // default) the simulated `ot-rcp` radio; both are built lazily out of
+        // the submodules vendored in the Chip checkout (cached on disk). The
+        // BLE suite needs the same stack for its BLE-Thread flow.
+        if target == THREAD_TARGET || tests.iter().any(|t| Self::ble_thread(t, target)) {
+            self.chip_builder.build_otbr(None, false)?;
+        }
+
+        // Re-assert the CHIP Python wheel *after* the lazy app builds above.
+        //
+        // Each of them re-enters `setup_chip`, which re-provisions the pigweed
+        // virtualenv and thereby drops everything pip-installed into it from
+        // the outside - including the `matter` wheels that `run_python_test.py`
+        // imports. Installing them once during `itest-setup` is therefore not
+        // enough: a suite that pulls in a CHIP counterpart app (the commissioner
+        // suite via `chip-all-clusters-app`, the `OTA_*` tests via the OTA apps)
+        // silently unprovisions every Python test that runs after it, which
+        // surfaces as `ModuleNotFoundError: No module named 'matter.testing'`.
+        //
+        // `build_python_wheel` probes before doing any work, so this is close to
+        // free when the venv is intact.
+        self.chip_builder.build_python_wheel(false)?;
+
+        // Activate the CHIP build environment ONCE and capture the resulting
+        // environment variables. `scripts/run_in_build_env.sh` re-runs the full
+        // pigweed activation (CIPD manifest regeneration, `pw_activate`, git
+        // submodule probes) on every invocation - several seconds each - so
+        // per-test activation used to be a fixed tax on all ~150 tests of a
+        // system-suite run. The activated environment is just a set of
+        // variables that is a pure function of the checkout, so one capture
+        // serves every test. This mirrors CHIP's own CI, which activates once
+        // around a whole batch runner.
+        let chip_env = self.capture_chip_env()?;
+
+        // Run the tests. Python (`TC_*`) tests keep one process each - their
+        // wrappers, shims and timeouts are all per-test - while YAML tests
+        // sharing the same per-invocation configuration (see
+        // `Self::yaml_batch_key`) are folded into a single `run_test_suite.py`
+        // invocation. The runner still restarts and re-pairs the app for every
+        // test inside a batch; what is amortized is the (multi-second) Python
+        // runner startup and network-namespace setup, once per batch instead
+        // of once per test.
+        let mut done = vec![false; tests.len()];
+        for i in 0..tests.len() {
+            if done[i] {
+                continue;
+            }
+
+            if Self::is_python_test(tests[i]) {
+                done[i] = true;
+                self.run_python_test(tests[i], test_timeout_secs, profile, target, &chip_env)?;
+            } else {
+                let key = Self::yaml_batch_key(tests[i]);
+
+                let mut batch = Vec::new();
+                for j in i..tests.len() {
+                    if !done[j]
+                        && !Self::is_python_test(tests[j])
+                        && Self::yaml_batch_key(tests[j]) == key
+                    {
+                        done[j] = true;
+                        batch.push(tests[j]);
+                    }
+                }
+
+                self.run_yaml_batch(&batch, test_timeout_secs, profile, target, &chip_env)?;
+            }
         }
 
         info!("All tests completed successfully.");
@@ -823,25 +1289,78 @@ impl ITests {
         Ok(())
     }
 
-    fn run_test(
-        &self,
-        test_name: &str,
-        timeout_secs: u32,
-        profile: &str,
-        target: &str,
-    ) -> anyhow::Result<()> {
-        // TODO: Running test-by-test is slow. Turn this into a run-multiple-tests function.
+    /// Grouping key for folding YAML tests into one `run_test_suite.py`
+    /// invocation. Tests may share an invocation only when they agree on
+    /// everything that is fixed per-invocation:
+    /// - the `.pics` file and the `RS_MATTER_WIRELESS_THREAD` device-flavour
+    ///   selection, both determined by [`WirelessFlavour::of`];
+    /// - the OTA app-path wiring, which is role-specific - so `OTA_*` tests
+    ///   stay singleton batches, keyed by their own (role-suffixed) name.
+    fn yaml_batch_key(test_name: &str) -> (Option<WirelessFlavour>, Option<&str>) {
+        let real_name = test_name.strip_suffix("@requestor").unwrap_or(test_name);
 
-        // Some tests legitimately need more wall-clock time than the default
-        // (e.g. those that wait for a commissioning window to expire on its
-        // own). Allow per-test overrides while keeping the global `--timeout`
-        // as the floor for everything else.
-        let timeout_secs = Self::per_test_timeout_secs(test_name).unwrap_or(timeout_secs);
+        (
+            WirelessFlavour::of(test_name),
+            real_name.starts_with("OTA_").then_some(test_name),
+        )
+    }
 
-        info!("=> Running test `{test_name}` with timeout {timeout_secs}s...");
+    /// Activate the CHIP build environment and capture the resulting process
+    /// environment, NUL-separated via a temp file (the activation itself
+    /// prints to stdout, so stdout cannot carry the dump).
+    fn capture_chip_env(&self) -> anyhow::Result<HashMap<String, String>> {
+        info!("Capturing the CHIP build environment (one-time activation)...");
 
         let chip_dir = self.chip_builder.chip_dir();
+        let script_path = chip_dir.join("scripts/run_in_build_env.sh");
 
+        // A `NamedTempFile` rather than a hand-rolled path in the shared temp
+        // dir: the file is pre-created 0600 with an unpredictable name (no
+        // symlink-clobber window), and it is deleted on drop, early returns
+        // included.
+        let env_file = tempfile::NamedTempFile::new()?;
+
+        let mut cmd = Command::new(&script_path);
+        cmd.current_dir(chip_dir)
+            .env("CHIP_HOME", chip_dir)
+            .arg(format!("env -0 > '{}'", env_file.path().display()));
+
+        run_command(&mut cmd, self.print_cmd_output)?;
+
+        let data = fs::read(env_file.path()).map_err(|e| {
+            anyhow::anyhow!(
+                "CHIP environment activation did not produce {}: {e}",
+                env_file.path().display()
+            )
+        })?;
+
+        let mut env_map = HashMap::new();
+        for entry in data.split(|byte| *byte == 0) {
+            let entry = String::from_utf8_lossy(entry);
+            if let Some((key, value)) = entry.split_once('=') {
+                if !key.is_empty() {
+                    env_map.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+
+        // A capture without PATH means the activation output is unusable -
+        // every test command resolves python/chip-tool through it.
+        if !env_map.contains_key("PATH") {
+            anyhow::bail!("CHIP environment capture has no PATH; activation output looks corrupt");
+        }
+
+        info!(
+            "CHIP build environment captured ({} variables)",
+            env_map.len()
+        );
+
+        Ok(env_map)
+    }
+
+    /// Best-effort cleanup of processes left in the `app` network namespace by
+    /// a previous (possibly crashed) run.
+    fn kill_netns_leftovers(&self, chip_dir: &Path) {
         info!("Killing all netns processes in app namespace to clean previous runs");
         // If this fails, that's ok; best-effort
         _ = run_command(
@@ -855,19 +1374,102 @@ impl ITests {
                 .current_dir(chip_dir),
             self.print_cmd_output,
         );
+    }
 
-        let test_command = if Self::is_python_test(test_name) {
-            self.python_test_command(test_name, timeout_secs, profile, target)?
+    fn run_python_test(
+        &self,
+        test_name: &str,
+        timeout_secs: u32,
+        profile: &str,
+        target: &str,
+        chip_env: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        // Some tests legitimately need more wall-clock time than the default
+        // (e.g. those that wait for a commissioning window to expire on its
+        // own). Allow per-test overrides while keeping the global `--timeout`
+        // as the floor for everything else.
+        let timeout_secs = Self::per_test_timeout_secs(test_name).unwrap_or(timeout_secs);
+
+        info!("=> Running test `{test_name}` with timeout {timeout_secs}s...");
+
+        let chip_dir = self.chip_builder.chip_dir();
+
+        self.kill_netns_leftovers(chip_dir);
+
+        let test_command = self.python_test_command(test_name, timeout_secs, profile, target)?;
+
+        // `run_python_test.py` has no equivalent of `run_test_suite.py`'s
+        // `--ble-wifi`, so the mock Bluetooth stack is stood up here and torn
+        // down when `_ble_env` drops at the end of this function.
+        let _ble_env = (target == BLE_TARGET)
+            .then(|| BleEnv::start(chip_dir))
+            .transpose()?;
+
+        // Likewise the Thread stack: one fresh `otbr-agent` per test, so a
+        // dataset the previous test attached to can't leak into the next one
+        // (the app itself is factory-reset by the runner, but the Thread
+        // stack lives in the agent). For the BLE-Thread flow the agent joins
+        // the mock-Bluetooth bus instead of owning one, so that the single
+        // `DBUS_SYSTEM_BUS_ADDRESS` the processes inherit reaches both
+        // `org.bluez` and `io.openthread.BorderRouter`.
+        let _otbr_env = if target == THREAD_TARGET {
+            Some(OtbrEnv::start(
+                &self.chip_builder.otbr_agent_path(),
+                &self.chip_builder.ot_rcp_sim_path(),
+            ))
         } else {
-            self.yaml_test_command(test_name, timeout_secs, profile, target)
-        };
+            _ble_env
+                .as_ref()
+                .filter(|_| Self::ble_thread(test_name, target))
+                .map(|ble_env| {
+                    OtbrEnv::start_on(
+                        &ble_env.dbus_address(),
+                        &self.chip_builder.otbr_agent_path(),
+                        &self.chip_builder.ot_rcp_sim_path(),
+                    )
+                })
+        }
+        .transpose()?;
 
-        let script_path = chip_dir.join("scripts/run_in_build_env.sh");
-
-        let mut cmd = Command::new(&script_path);
+        // The command runs with the pre-captured CHIP build environment
+        // injected (see `Self::capture_chip_env`) instead of being wrapped in
+        // `run_in_build_env.sh`, which would re-do the activation every time.
+        let mut cmd = Command::new("bash");
         cmd.current_dir(chip_dir)
+            .envs(chip_env)
             .env("CHIP_HOME", chip_dir)
+            .arg("-c")
             .arg(&test_command);
+
+        if let Some(ble_env) = &_ble_env {
+            cmd.env("DBUS_SYSTEM_BUS_ADDRESS", ble_env.dbus_address());
+        }
+
+        if let Some(otbr_env) = &_otbr_env {
+            // The driver finds `otbr-agent` through the private bus (in the
+            // BLE-Thread case this is the mock-Bluetooth bus again). Only the
+            // `thread` suite's driver auto-attaches to the suite's first
+            // dataset at startup - in the BLE flow the commissioner provisions
+            // the network itself.
+            cmd.env("DBUS_SYSTEM_BUS_ADDRESS", otbr_env.dbus_address());
+
+            if target == THREAD_TARGET {
+                cmd.env("RS_MATTER_THREAD_DATASET", THREAD_DATASET_1);
+            }
+        }
+
+        // The Thread flavour of `wireless_tests` is selected out of the
+        // environment (inherited by the app the runner launches). Only for
+        // that target — the same test names in the `thread` suite drive a
+        // driver with no flavour switch.
+        if target == "wireless_tests"
+            && matches!(
+                WirelessFlavour::of(test_name),
+                Some(WirelessFlavour::Thread)
+            )
+        {
+            cmd.env("RS_MATTER_WIRELESS_THREAD", "1");
+        }
 
         match run_command(&mut cmd, self.print_cmd_output) {
             Ok(()) => info!("Test `{test_name}` completed successfully"),
@@ -876,6 +1478,176 @@ impl ITests {
                 return Err(err);
             }
         };
+
+        Ok(())
+    }
+
+    /// Run a batch of YAML tests in a single `run_test_suite.py` invocation.
+    ///
+    /// All batch members share one per-invocation configuration - guaranteed
+    /// by [`Self::yaml_batch_key`] - and none of them has a
+    /// [`Self::per_test_timeout_secs`] override (those are all `TC_*` Python
+    /// tests), so the suite default applies to every member, enforced
+    /// per-test by the runner itself via `--test-timeout-seconds`.
+    fn run_yaml_batch(
+        &self,
+        batch: &[&str],
+        timeout_secs: u32,
+        profile: &str,
+        target: &str,
+        chip_env: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        info!(
+            "=> Running YAML test batch of {} test(s) with per-test timeout {timeout_secs}s: {batch:?}...",
+            batch.len()
+        );
+
+        let chip_dir = self.chip_builder.chip_dir();
+
+        self.kill_netns_leftovers(chip_dir);
+
+        let test_command = self.yaml_batch_command(batch, timeout_secs, profile, target);
+
+        // One `otbr-agent` for the whole batch: the YAML Thread tests only
+        // read diagnostics, so cross-test dataset leakage is not a concern
+        // and the (several-second) agent startup is better amortized.
+        let _otbr_env = (target == THREAD_TARGET)
+            .then(|| {
+                OtbrEnv::start(
+                    &self.chip_builder.otbr_agent_path(),
+                    &self.chip_builder.ot_rcp_sim_path(),
+                )
+            })
+            .transpose()?;
+
+        // See `run_python_test` for why the captured environment replaces the
+        // `run_in_build_env.sh` wrapper.
+        let mut cmd = Command::new("bash");
+        cmd.current_dir(chip_dir)
+            .envs(chip_env)
+            .env("CHIP_HOME", chip_dir)
+            .arg("-c")
+            .arg(&test_command);
+
+        if let Some(otbr_env) = &_otbr_env {
+            cmd.env("DBUS_SYSTEM_BUS_ADDRESS", otbr_env.dbus_address());
+            cmd.env("RS_MATTER_THREAD_DATASET", THREAD_DATASET_1);
+        }
+
+        // `run_test_suite.py` spawns the device itself and takes no per-app
+        // arguments, so the Thread flavour of `wireless_tests` is selected out
+        // of the environment instead (inherited by the app it launches).
+        // Uniform across the batch by construction of the batch key, and only
+        // meaningful for the `wireless_tests` target (see `run_python_test`).
+        if target == "wireless_tests"
+            && matches!(WirelessFlavour::of(batch[0]), Some(WirelessFlavour::Thread))
+        {
+            cmd.env("RS_MATTER_WIRELESS_THREAD", "1");
+        }
+
+        match run_command(&mut cmd, self.print_cmd_output) {
+            Ok(()) => {
+                // A zero exit status is NOT sufficient for the YAML suites:
+                // `run_test_suite.py` has been observed to exit 0 while
+                // individual tests were marked failed, so a failing YAML test
+                // would silently pass the whole run (and CI with it). It also
+                // merely logs (and skips) `--target` names it does not know,
+                // which with a batched invocation would silently drop
+                // coverage e.g. across an upstream test rename. Consult the
+                // JSON run summary instead - that is the authoritative
+                // per-test verdict - and require every batch member to appear
+                // in it as passed.
+                Self::assert_yaml_summary_clean(batch)?;
+
+                info!("YAML test batch completed successfully: {batch:?}")
+            }
+            Err(err) => {
+                info!("Command failed: {}", test_command);
+
+                // Best-effort: surface which test(s) of the batch failed,
+                // if the runner got as far as writing the summary.
+                if let Err(summary_err) = Self::assert_yaml_summary_clean(batch) {
+                    warn!("{summary_err}");
+                }
+
+                return Err(err);
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Path of the JSON run summary that `run_test_suite.py` is asked to write
+    /// for a batch (see `--summary-file` in [`Self::yaml_batch_command`]).
+    /// Keyed by the batch's first test name, which is unique within a run.
+    fn yaml_summary_path(batch: &[&str]) -> PathBuf {
+        env::temp_dir().join(format!("xtask-yaml-summary-{}.json", batch[0]))
+    }
+
+    /// Fail unless the batch's YAML run summary records every requested test
+    /// as passed.
+    ///
+    /// Two failure modes are covered:
+    /// - a test ran and failed (`run_test_suite.py` has been observed to exit
+    ///   0 in that situation);
+    /// - a test never ran at all: the runner only *logs* an unknown `--target`
+    ///   name and carries on with the rest, so e.g. an upstream rename would
+    ///   otherwise silently drop coverage from a batch.
+    fn assert_yaml_summary_clean(batch: &[&str]) -> anyhow::Result<()> {
+        let path = Self::yaml_summary_path(batch);
+
+        let Ok(summary) = fs::read_to_string(&path) else {
+            // No summary: an older `run_test_suite.py` without `--summary-file`,
+            // or a run that died before writing it. Don't turn that into a
+            // failure - the exit status already passed - but make the loss of
+            // coverage visible rather than silently trusting the exit code.
+            warn!(
+                "YAML batch {batch:?}: no run summary at {} - cannot verify per-test results",
+                path.display()
+            );
+            return Ok(());
+        };
+
+        let summary: serde_json::Value = serde_json::from_str(&summary).map_err(|e| {
+            anyhow::anyhow!(
+                "YAML batch {batch:?}: run summary at {} is not valid JSON: {e}",
+                path.display()
+            )
+        })?;
+
+        let results = summary["results"].as_array().cloned().unwrap_or_default();
+
+        for test_name in batch {
+            // OTA role suffixes are an xtask-ism; the runner reports the
+            // upstream name.
+            let real_name = test_name.strip_suffix("@requestor").unwrap_or(test_name);
+
+            // The runner matches `--target` names case-insensitively, so
+            // mirror that when looking its reports back up.
+            let result = results.iter().find(|result| {
+                result["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(real_name))
+            });
+
+            let Some(result) = result else {
+                anyhow::bail!(
+                    "Test `{test_name}` is absent from the run summary ({}) - \
+                     most likely `run_test_suite.py` did not recognize the target name",
+                    path.display()
+                );
+            };
+
+            // `TestStatus` is a `StrEnum`, so statuses serialize as lowercase
+            // strings ("passed" / "failed" / "cancelled" / "dry_run").
+            let status = result["status"].as_str().unwrap_or("<unknown>");
+            if status != "passed" {
+                anyhow::bail!(
+                    "Test `{test_name}` reported status `{status}` in the run summary ({})",
+                    path.display()
+                );
+            }
+        }
 
         Ok(())
     }
@@ -915,8 +1687,7 @@ impl ITests {
         // 1. Build the upstream device binary lazily (cached).
         self.chip_builder.build_chip_all_clusters_app(None, false)?;
 
-        let chip_dir = self.chip_builder.chip_dir();
-        let app_path = chip_dir.join("out/host/chip-all-clusters-app");
+        let app_path = self.chip_builder.all_clusters_app_path();
         if !app_path.exists() {
             anyhow::bail!(
                 "`chip-all-clusters-app` not found at {}",
@@ -1092,18 +1863,21 @@ impl ITests {
         Ok(())
     }
 
-    fn yaml_test_command(
+    fn yaml_batch_command(
         &self,
-        test_name: &str,
+        batch: &[&str],
         timeout_secs: u32,
         profile: &str,
         target: &str,
     ) -> String {
         let chip_dir = self.chip_builder.chip_dir();
         let test_suite_path = chip_dir.join("scripts/tests/run_test_suite.py");
-        let chip_tool_path = chip_dir.join("out/host/chip-tool");
+        let chip_tool_path = self.chip_builder.chip_tool_path();
         let test_exe_path = self.test_exe_path(profile, target);
-        let test_pics_path = self.test_pics_path(target);
+        // Uniform across the batch by construction of the batch key (the
+        // wireless flavour is the only thing that changes it for a fixed
+        // `target`).
+        let test_pics_path = self.test_pics_path(batch[0], target);
 
         // OTA tests (`OTA_*`) run as a 3-party flow: the YAML commissions both an
         // OTA provider and an OTA requestor. We slot the rs-matter `system_tests`
@@ -1111,22 +1885,24 @@ impl ITests {
         // the other. A `@requestor` suffix on the test name selects the role
         // (rs-matter as the requestor DUT); default is rs-matter as the provider.
         // The suffix is stripped before the YAML name is handed to the runner.
-        let (real_name, rs_is_requestor) = match test_name.strip_suffix("@requestor") {
+        // OTA tests are singleton batches (see `Self::yaml_batch_key`), so
+        // inspecting `batch[0]` covers them fully.
+        let (real_first, rs_is_requestor) = match batch[0].strip_suffix("@requestor") {
             Some(name) => (name, true),
-            None => (test_name, false),
+            None => (batch[0], false),
         };
-        let ota_app_clause = if real_name.starts_with("OTA_") {
-            let chip_requestor = chip_dir.join("out/host/chip-ota-requestor-app");
-            let chip_provider = chip_dir.join("out/host/chip-ota-provider-app");
+        let ota_app_clause = if real_first.starts_with("OTA_") {
+            let chip_requestor = self.chip_builder.ota_requestor_app_path();
+            let chip_provider = self.chip_builder.ota_provider_app_path();
             if rs_is_requestor {
                 format!(
-                    " --ota-requestor-app '{}' --ota-provider-app '{}'",
+                    " --app-path 'ota-requestor:{}' --app-path 'ota-provider:{}'",
                     test_exe_path.display(),
                     chip_provider.display(),
                 )
             } else {
                 format!(
-                    " --ota-provider-app '{}' --ota-requestor-app '{}'",
+                    " --app-path 'ota-provider:{}' --app-path 'ota-requestor:{}'",
                     test_exe_path.display(),
                     chip_requestor.display(),
                 )
@@ -1135,15 +1911,58 @@ impl ITests {
             String::new()
         };
 
+        // One `--target` per batch member; the runner takes the option
+        // repeatedly and runs the matches in the given order.
+        let targets_clause = batch
+            .iter()
+            .map(|test_name| {
+                format!(
+                    " --target {}",
+                    test_name.strip_suffix("@requestor").unwrap_or(test_name)
+                )
+            })
+            .collect::<String>();
+
+        // Ask for a JSON run summary and drop any stale one first: a zero exit
+        // status from `run_test_suite.py` does not imply the tests passed (see
+        // `Self::assert_yaml_summary_clean`), so this file is what we actually
+        // judge the run by.
+        let summary_path = Self::yaml_summary_path(batch);
+        _ = fs::remove_file(&summary_path);
+
+        // NB: `--tool-path` / `--app-path` are options of the `run` subcommand,
+        // whereas the `--chip-tool` flag they replace was a group-level one -
+        // hence the tool path now sits *after* `run`, not before it.
+        //
+        // The DUT binary is registered under *both* the `all-clusters` and
+        // `all-devices` keys because the runner picks the slot from the test's
+        // own target (`Test_TC_OO_*` resolve to `all-devices`, the YAML suites
+        // to `all-clusters`) and errors with `KeyError: 'default'` when that
+        // slot is empty. The `lock` slot serves `TestSystemCommands`, which
+        // spawns a second accessory from it. The `lit-icd` slot serves the
+        // `TestIcd*` suites, which the runner classifies as the `LIT_ICD`
+        // target: it launches the DUT from that slot and pairs with
+        // `--icd-registration true`, driving commissioning-time ICD client
+        // registration. Registering a slot no test selects is free: the
+        // runner only ever starts the app it resolved to `default` (plus, for
+        // `TestSystemCommands`, the explicitly-started second instance).
+        // `--log-level info` (not `warn`): with a whole batch inside one
+        // invocation, the per-test "Executing ..." progress lines have to come
+        // from the runner itself, or a hung batch is a silent wall of nothing
+        // in the CI log until the job-level timeout kills it.
         format!(
-            "{} --log-level warn --target {} --runner chip_tool_python --chip-tool {} run --iterations 1 --test-timeout-seconds {} --all-clusters-app '{}'{} --pics-file {}",
+            "{} --log-level info{} --runner chip_tool_python run --iterations 1 --test-timeout-seconds {} --tool-path 'chip-tool:{}' --app-path 'all-clusters:{}' --app-path 'all-devices:{}' --app-path 'lock:{}' --app-path 'lit-icd:{}'{} --pics-file {} --summary-file '{}'",
             test_suite_path.display(),
-            real_name,
-            chip_tool_path.display(),
+            targets_clause,
             timeout_secs,
+            chip_tool_path.display(),
+            test_exe_path.display(),
+            test_exe_path.display(),
+            test_exe_path.display(),
             test_exe_path.display(),
             ota_app_clause,
             test_pics_path.display(),
+            summary_path.display(),
         )
     }
 
@@ -1157,6 +1976,14 @@ impl ITests {
         let chip_dir = self.chip_builder.chip_dir();
         let runner_path = chip_dir.join("scripts/tests/run_python_test.py");
         let test_exe_path = self.test_exe_path(profile, target);
+
+        // A `@bluer` suffix re-runs the same test against the alternative BLE
+        // backend; it is stripped before the script name is resolved.
+        let (test_name, bluer) = match test_name.strip_suffix("@bluer") {
+            Some(name) => (name, true),
+            None => (test_name, false),
+        };
+
         let script_path = chip_dir
             .join("src/python_testing")
             .join(format!("{test_name}.py"));
@@ -1182,7 +2009,7 @@ impl ITests {
         // `run_python_test.py` also deletes the controller-side fabric state.
         // Without it, the Python SDK reuses stale fabric storage from previous
         // runs while the device has been factory-reset, causing AddNOC to fail.
-        let extra_args = Self::extra_python_script_args(test_name);
+        let extra_args = Self::extra_python_script_args(test_name, target);
         // Some tests (e.g. TC_SC_4_1) need to be commissioned via a setup
         // payload (manual or QR code) rather than the raw discriminator /
         // passcode pair, because their script logic inspects
@@ -1192,9 +2019,32 @@ impl ITests {
         // the framework attempt commissioning twice (once per setup
         // payload) and the second attempt times out, so we must drop the
         // raw form here.
+        let ble = target == BLE_TARGET;
+
         let commissioning_args = match Self::setup_payload_override(test_name) {
             Some(setup_payload) => setup_payload.to_string(),
             None => format!("--discriminator {discriminator} --passcode {passcode}"),
+        };
+        // The device takes `hci0` and the commissioner `hci1`, so the two ends
+        // of the link are distinct adapters - the arrangement CHIP's own
+        // BLE-Wi-Fi harness uses, and the one `bluezoo` publishes by default.
+        //
+        // The network credentials are what the commissioner provisions the DUT
+        // with over BTP: mock Wi-Fi ones, or - for the BLE-Thread flow - the
+        // suite's first (real) operational dataset, which then doubles as the
+        // network the CNET test expects to read back.
+        let ble_thread = Self::ble_thread(test_name, target);
+        let commissioning_args = if ble_thread {
+            format!(
+                "{commissioning_args} --ble-controller 1 --thread-dataset-hex {THREAD_DATASET_1}"
+            )
+        } else if ble {
+            format!(
+                "{commissioning_args} --ble-controller 1 \
+                 --wifi-ssid MatterAP --wifi-passphrase MatterAPPassword"
+            )
+        } else {
+            commissioning_args
         };
         // A handful of tests (e.g. TC_SC_7_1) only do PASE establishment in
         // the test body itself, and assert that the device starts factory
@@ -1202,6 +2052,10 @@ impl ITests {
         // assertion, so omit `--commissioning-method` for those tests.
         let commissioning_method = if Self::skip_pre_commissioning(test_name) {
             ""
+        } else if ble_thread {
+            "--commissioning-method ble-thread "
+        } else if ble {
+            "--commissioning-method ble-wifi "
         } else {
             "--commissioning-method on-network "
         };
@@ -1211,8 +2065,16 @@ impl ITests {
         // `chip-all-clusters-app` is the canonical implementation; its path
         // is plumbed in via the `th_server_app_path` string user-param.
         let th_server_arg = if Self::needs_th_server_app(test_name) {
-            let app = chip_dir.join("out/host/chip-all-clusters-app");
+            let app = self.chip_builder.all_clusters_app_path();
             format!(" --string-arg th_server_app_path:{}", app.display())
+        } else {
+            String::new()
+        };
+        // Tests that spawn `chip-all-clusters-app` themselves take its path via
+        // the `app_path` string user-param instead.
+        let app_path_arg = if Self::needs_all_clusters_app_arg(test_name) {
+            let app = self.chip_builder.all_clusters_app_path();
+            format!(" --string-arg app_path:{}", app.display())
         } else {
             String::new()
         };
@@ -1221,19 +2083,43 @@ impl ITests {
         } else {
             format!(" {extra_args}")
         };
+        // Python `MatterBaseTest` scripts don't receive the YAML runner's
+        // `--pics-file`; a script that gates its steps on `check_pics(...)`
+        // sees an empty PICS dict unless we hand it a `--PICS` file. Point the
+        // ones that need it at the target's own `.pics` (the same file the YAML
+        // runner uses), by absolute path since the runner's CWD is `chip_dir`.
+        let pics_clause = if Self::needs_target_pics(test_name) {
+            format!(
+                " --PICS {}",
+                self.test_pics_path(test_name, target).display()
+            )
+        } else {
+            String::new()
+        };
+        // Override the framework's 90s per-test `asyncio` budget for tests
+        // whose body legitimately runs longer (e.g. a 180s window-expiry wait).
+        let framework_timeout_clause = Self::per_test_framework_timeout_secs(test_name)
+            .map(|secs| format!(" --timeout {secs}"))
+            .unwrap_or_default();
+
         let script_args = format!(
             "--storage-path /tmp/rs_matter_python_test_storage.json \
              {commissioning_method}{commissioning_args} --endpoint 1 \
-             --paa-trust-store-path credentials/development/paa-root-certs{extra_args_clause}{th_server_arg}"
+             --paa-trust-store-path credentials/development/paa-root-certs{framework_timeout_clause}{extra_args_clause}{pics_clause}{th_server_arg}{app_path_arg}"
         );
 
         // Optional `--app-args` passed through to `system_tests`. Used by
         // tests like TC_SC_7_1 that require non-default discriminator /
         // passcode values, which the test then asserts (`assert_not_equal`
         // against `3840` / `20202021`).
-        let app_args_clause = match Self::app_args_override(test_name) {
-            Some(args) => format!(" --app-args '{args}'"),
-            None => String::new(),
+        let backend = if bluer { " --bluer" } else { "" };
+        let app_args_clause = match (ble, Self::app_args_override(test_name, target)) {
+            (true, Some(args)) => {
+                format!(" --app-args '--ble-controller 0{backend} {args}'")
+            }
+            (true, None) => format!(" --app-args '--ble-controller 0{backend}'"),
+            (false, Some(args)) => format!(" --app-args '{args}'"),
+            (false, None) => String::new(),
         };
 
         // Some tests need a vendored Python wrapper substituted in place of
@@ -1297,18 +2183,29 @@ impl ITests {
     /// via the vendored monkey-patching wrapper at
     /// `xtask/scripts/no_pase_setup_class_helper.py`. Each of these tests
     /// inherits from `BasicCompositionTests` and calls the helper with the
-    /// default `allow_pase=True`, which on `v1.5-branch` triggers a fresh
-    /// `EstablishPASESession` against a closed-window DUT and either hangs
-    /// 25 s on BlueZ activation or leaks a stale "in-progress PASE" entry
-    /// in the controller. Upstream fix `b180d46945` (PR #41712) on `master`
-    /// switches to `FindOrEstablishPASESession`; once that lands on
-    /// `v1.5-branch` (or we move to a newer chip gitref), this shim and
-    /// the entire `xtask/scripts/no_pase_setup_class_helper.py` wrapper
-    /// can be retired. See the script's docstring for the full diagnosis.
+    /// default `allow_pase=True`, which on `v1.5-branch` triggered a fresh
+    /// `EstablishPASESession` against a closed-window DUT and either hung
+    /// 25 s on BlueZ activation or leaked a stale "in-progress PASE" entry
+    /// in the controller. See the script's docstring for the full diagnosis.
+    ///
+    /// RETIRABLE: the upstream fix (`b180d46945`, PR #41712) *is* present at
+    /// the commit `CHIP_DEFAULT_GITREF` now pins - `basic_composition.py` there
+    /// calls `FindOrEstablishPASESession`, so the session is reused instead of
+    /// re-established and the race this works around is gone. The shim is kept
+    /// for now only so that the Matter 1.6 bump and this cleanup can be
+    /// bisected apart: removing it changes how three certification tests set
+    /// up, and that is only observable in a full `cargo xtask itest` run. Drop
+    /// this function, the branch in `yaml_test_command`, and
+    /// `xtask/scripts/no_pase_setup_class_helper.py` once a cert run has gone
+    /// green with the 1.6 data model.
     fn needs_no_pase_shim(test_name: &str) -> bool {
         matches!(
             test_name,
-            "TC_AccessChecker" | "TC_DeviceBasicComposition" | "TC_DeviceConformance"
+            "TC_AccessChecker"
+                | "TC_DeviceBasicComposition"
+                | "TC_DeviceConformance"
+                // Same `setup_class_helper` PASE+CASE race as the three above.
+                | "TC_IDM_4_3"
         )
     }
 
@@ -1356,8 +2253,16 @@ impl ITests {
                 | "TC_LCFG_2_1"      // has_cluster(LocalizationConfiguration)
                 | "TC_LTIME_3_1"     // has_cluster(TimeFormatLocalization)
                 | "TC_LUNIT_3_1"     // has_cluster(UnitLocalization) and has_attribute(TemperatureUnit)
-                | "TC_SWTCH"         // 5 inner methods, each has_feature(Switch, ...)
-                | "TC_ACL_2_5" // has_attribute(AccessControl.Extension)
+                // The latching (2_2) and multi-press (2_5 / 2_6) methods skip
+                // on their feature gates (`light_tests`' Generic Switch is
+                // `MS | MSR | MSL`); 2_3 / 2_4 run.
+                | "TC_SWTCH"
+                // All three test the optional `AccessControlExtension`
+                // feature (Extension attribute); rs-matter does not implement
+                // it, so `has_attribute(AccessControl.Extension)` skips cleanly.
+                | "TC_ACL_2_3"
+                | "TC_ACL_2_5"
+                | "TC_ACL_2_7"
         )
     }
 
@@ -1369,9 +2274,16 @@ impl ITests {
         match test_name {
             // Several CADMIN tests open commissioning windows and then wait
             // for them to expire on the device side, which takes 180s+ by
-            // construction.
-            "TC_CADMIN_1_3_4" | "TC_CADMIN_1_5" | "TC_CADMIN_1_9" | "TC_CADMIN_1_11"
-            | "TC_CADMIN_1_15" | "TC_CADMIN_1_22" | "TC_CADMIN_1_25" => Some(300),
+            // construction. `TC_CADMIN_1_3_4` runs *two* such test methods
+            // (`test_TC_CADMIN_1_3` and `_1_4`) back-to-back in one process,
+            // so this whole-process ceiling must cover both, each with the
+            // per-method budget in `per_test_framework_timeout_secs`.
+            "TC_CADMIN_1_3_4" => Some(600),
+            // Sends several real multicast group commands with fixed 3s
+            // settling sleeps in between, plus event-report awaits.
+            "TC_ACE_1_6" => Some(360),
+            "TC_CADMIN_1_5" | "TC_CADMIN_1_9" | "TC_CADMIN_1_11" | "TC_CADMIN_1_15"
+            | "TC_CADMIN_1_22" | "TC_CADMIN_1_25" => Some(360),
             // TC_OPCREDS_3_8 exercises the VID-Verification feature (Matter
             // 1.4): it sets a 400-byte VVSC and an 85-byte
             // VIDVerificationStatement on a fabric and then issues
@@ -1387,6 +2299,36 @@ impl ITests {
             // back-to-back; each commissioning attempt blocks for ~30 s, so
             // the wall-clock budget needs ~210 s + setup overhead.
             "TC_DA_1_9" => Some(360),
+            // Declares its own `default_timeout = 600` (subscription-interval
+            // waits across 12+ steps); the process ceiling must exceed it.
+            "TC_IDM_4_3" => Some(700),
+            // Three PAN switches, each followed by a
+            // `ConnectMaxTimeSeconds + fudge` settling sleep plus a CASE
+            // re-establishment against the moved DUT.
+            "TC_CNET_4_12" => Some(600),
+            _ => None,
+        }
+    }
+
+    /// The Matter test framework's *per-test-method* `asyncio` budget, passed
+    /// as `--timeout`. Distinct from [`Self::per_test_timeout_secs`], which is
+    /// the process-level wall-clock kill covering the whole invocation.
+    ///
+    /// Without `--timeout` the framework uses its 90s `default_timeout`, and a
+    /// test method that waits ~180s for a commissioning window to expire is
+    /// cancelled mid-flight the instant that wait ends — surfacing as an
+    /// `asyncio` `CancelledError`/`TimeoutError`, not an rs-matter fault.
+    /// Upstream passes `--timeout` in the test's metadata `script-args` for the
+    /// same reason; we build our own script args, so we set it here.
+    fn per_test_framework_timeout_secs(test_name: &str) -> Option<u32> {
+        match test_name {
+            // Each of `test_TC_CADMIN_1_3` / `_1_4` waits ~180s for a
+            // commissioning window to expire before opening the next one.
+            "TC_CADMIN_1_3_4" | "TC_CADMIN_1_5" | "TC_CADMIN_1_9" | "TC_CADMIN_1_11"
+            | "TC_CADMIN_1_15" | "TC_CADMIN_1_22" | "TC_CADMIN_1_25" => Some(300),
+            // The settling sleeps alone (3 × `ConnectMaxTimeSeconds + fudge`)
+            // exceed the framework's default 90s per-method budget.
+            "TC_CNET_4_12" => Some(480),
             _ => None,
         }
     }
@@ -1460,15 +2402,23 @@ impl ITests {
     /// framework as a TH_SERVER). Drives the lazy build in `run_tests`.
     fn needs_chip_all_clusters_app(test_name: &str) -> bool {
         // TC_SC_3_5 plumbs the path through `--string-arg th_server_app_path`
-        // (see `needs_th_server_app`). TC_DA_1_9 spawns the binary itself
-        // via `--string-arg app_path:out/host/chip-all-clusters-app` (see
-        // `extra_python_script_args`).
+        // (see `needs_th_server_app`). TC_DA_1_9 spawns the binary itself and
+        // takes it via `--string-arg app_path` (see
+        // `needs_all_clusters_app_arg`).
         matches!(test_name, "TC_SC_3_5" | "TC_DA_1_9")
     }
 
     /// Tests that need the CHIP `chip-all-clusters-app` binary path injected
     /// as the `th_server_app_path` string user-param (consumed by
     /// `matter.testing.apps.AppServerSubprocess`).
+    /// Tests that spawn `chip-all-clusters-app` themselves and take its path
+    /// via the `app_path` string user-param.
+    fn needs_all_clusters_app_arg(test_name: &str) -> bool {
+        // TC_DA_1_9 launches the binary repeatedly, each time with a different
+        // revoked DAC/PAI configuration.
+        matches!(test_name, "TC_DA_1_9")
+    }
+
     fn needs_th_server_app(test_name: &str) -> bool {
         // TC_SC_3_5 ("CASE Error Handling [DUT_Initiator]") spawns a TH_SERVER
         // and uses CHIP's `FaultInjection` cluster on it to corrupt Sigma2
@@ -1477,12 +2427,66 @@ impl ITests {
         matches!(test_name, "TC_SC_3_5")
     }
 
+    /// Whether this Python test must be handed the target's own `.pics` file.
+    ///
+    /// Tests that read attributes conditionally on `check_pics(...)` (and assert
+    /// that a mandatory attribute *is* in the PICS) need the DUT's real PICS
+    /// claims, not the empty default. `TC_ICDM_2_1` gates every attribute read
+    /// this way; `TC_ICDM_3_2/3_3/3_4` gate on `ICDM.S.F00`, and the target
+    /// `.pics` also carries `PICS_SDK_CI_ONLY=1` so 3_2/3_4 take their
+    /// reboot-free CI path.
+    fn needs_target_pics(test_name: &str) -> bool {
+        matches!(
+            test_name,
+            "TC_ICDM_2_1" | "TC_ICDM_3_2" | "TC_ICDM_3_3" | "TC_ICDM_3_4" | "TC_ICDM_5_1"
+            // `TC_BINFO_2_2` cross-checks the events it observes against the
+            // declared PICS (`BINFO.S.E02` for `Leave`): with no `--PICS`,
+            // `check_pics` answers false and an *emitted* Leave event fails
+            // the consistency assert.
+            | "TC_BINFO_2_2"
+            // `TC_IDM_10_1` (a sub-test of `TC_DeviceBasicComposition`) rejects
+            // identifiers carrying a *test* vendor prefix (0xFFF1..=0xFFF4)
+            // unless `PICS_SDK_CI_ONLY` is set, in which case it only rejects
+            // 0xFFF5 and above. The example fixtures legitimately use test
+            // vendor IDs - the `UnitTesting` cluster is 0xFFF1FC05 and carries
+            // MEI attributes/commands under the 0xFFF2 prefix - exactly as
+            // CHIP's own example apps do. The target `.pics` sets
+            // `PICS_SDK_CI_ONLY=1`, so handing it over is what makes the check
+            // apply the SDK-example rule rather than the shipping-product one.
+            | "TC_DeviceBasicComposition"
+            // `TC_DeviceConformance` likewise reads `is_pics_sdk_ci_only`
+            // (in `check_conformance`), so it needs the target `.pics` too.
+            | "TC_DeviceConformance"
+        )
+    }
+
+    /// Whether this test runs the BLE suite's BLE-**Thread** flow: commissioned
+    /// with `--commissioning-method ble-thread`, against the `--thread` flavour
+    /// of `ble_tests` plus an `otbr-agent` on the same mock-Bluetooth bus.
+    ///
+    /// Piggy-backs on [`WirelessFlavour`]: the same Wi-Fi/Thread split decides
+    /// which network type a BLE commissioning provisions.
+    fn ble_thread(test_name: &str, target: &str) -> bool {
+        let test_name = test_name.strip_suffix("@bluer").unwrap_or(test_name);
+
+        target == BLE_TARGET
+            && matches!(
+                WirelessFlavour::of(test_name),
+                Some(WirelessFlavour::Thread)
+            )
+    }
+
     /// Optional `--app-args` passed straight through to `system_tests`.
     ///
     /// `system_tests` recognises `--discriminator <u16>` and
     /// `--passcode <u32>`; both override the spec-default `TEST_DEV_COMM`
     /// values for tests that demand non-defaults.
-    fn app_args_override(test_name: &str) -> Option<&'static str> {
+    fn app_args_override(test_name: &str, target: &str) -> Option<&'static str> {
+        // The BLE-Thread flow drives the `--thread` flavour of `ble_tests`.
+        if Self::ble_thread(test_name, target) {
+            return Some("--thread");
+        }
+
         match test_name {
             // Match the values encoded in the QR code returned by
             // `setup_payload_override` for this test (MT:-24J0KCZ16N71648G00).
@@ -1500,7 +2504,40 @@ impl ITests {
             // `{"Name":"SimulateConfigurationVersionChange"}` to the named
             // pipe and the DUT translates that into a
             // `DataModel::bump_configuration_version` call.
+            // NOTE: do NOT route `TC_BINFO_2_1` at the `--app-pipe` app
+            // variant, even though that would let its `DeviceLocation` steps
+            // 24-28 execute (rs-matter implements the attribute — see
+            // `basic_info::CLUSTER_DEVICE_LOCATION`). Upstream's
+            // `support_modules/binfo_attributes_verification.py` cannot run
+            // those steps against ANY conformant DUT: it references a
+            // `BasicInformation.Structs.DeviceLocationStruct` class the
+            // generated cluster objects never define (the attribute is typed
+            // as the global `LocationDescriptorStruct`), its null checks
+            // compare the decoded `NullValue` sentinel against Python `None`
+            // (step 24 `is None` / step 26 `assert_equal(..., None)`), and
+            // its step-25 write passes `areaType=None`, which the cluster
+            // object encoder rejects for a nullable-but-not-optional field
+            // (`NullValue` is required). Upstream CI never notices because
+            // its reference apps do not advertise the provisional attribute,
+            // so `attribute_guard` always skips the steps. Until that module
+            // is fixed upstream, the steps skip here too, and the attribute
+            // is covered by rs-matter's own e2e test instead.
             "TC_BINFO_3_2" => Some("--app-pipe /tmp/rs_matter_bin_info_3_2_fifo"),
+            // `TC_SWTCH` simulates the Generic Switch presses via app-pipe
+            // commands (`SimulateLongPress` / `SimulateSwitchIdle`); the
+            // same path is handed to the Python side in `test_args`.
+            "TC_SWTCH" => Some("--app-pipe /tmp/rs_matter_swtch_fifo"),
+            // The `TC_GC_*` suite runs against the Groupcast-enabled app
+            // composition (`NODE_GROUPCAST` in `system_tests`): the
+            // Groupcast cluster on EP0 plus the aux-ACL-enabled Access
+            // Control metadata. Deliberately NOT the default composition:
+            // with `AUXILIARY` advertised, wildcard-target Group-auth ACL
+            // entries no longer cover EP0 (Matter Core spec), which would
+            // break `TestGroupMessaging`'s legacy group-addressed writes to
+            // root-endpoint attributes - upstream likewise runs that suite
+            // against a non-groupcast app variant.
+            "TC_GC_2_1" | "TC_GC_2_2" | "TC_GC_2_3" | "TC_GC_2_4" | "TC_GC_2_5" | "TC_GC_2_6"
+            | "TC_GC_2_7" | "TC_GC_2_8" | "TC_ACE_1_6" => Some("--groupcast"),
             // TC_TestEventTrigger validates `GeneralDiagnostics::TestEventTrigger`
             // key/trigger handling — needs the canonical CHIP enable-key
             // 000102030405060708090a0b0c0d0e0f plumbed through to the device's
@@ -1510,6 +2547,17 @@ impl ITests {
             // wrapper around `()` that flips `TestEventTriggersEnabled` to
             // true and validates the key/trigger per spec §11.12.7.1.
             "TC_TestEventTrigger" => Some("--enable-key 000102030405060708090a0b0c0d0e0f"),
+            // The Thread half of the `wireless` suite drives the same
+            // `wireless_tests` binary in its Thread flavour; the Wi-Fi tests
+            // take the default. The two network stores are distinct types, so
+            // the binary picks one at startup rather than switching later.
+            // Only for that target: the same test names in the `thread` suite
+            // drive `thread_tests`, which has no flavour switch.
+            "TC_CNET_4_2" | "TC_CNET_4_10" | "TC_CNET_4_16" | "TC_CNET_4_22"
+                if target == "wireless_tests" =>
+            {
+                Some("--thread")
+            }
             // TC_DGSW_2_2 triggers a `SoftwareFault` event via
             // `GeneralDiagnostics::TestEventTrigger` (trigger code
             // 0x0034000000000000, Matter spec §11.13.7). The Python helper
@@ -1517,6 +2565,15 @@ impl ITests {
             // sequence below — wire the same value into the DUT so the
             // key check in `TestEventTriggerDiag::test_event_trigger` accepts.
             "TC_DGSW_2_2" => Some("--enable-key 000102030405060708090a0b0c0d0e0f"),
+            // TC_ICDM_3_1 drives the ICD registration flow but first sends the
+            // `kAddActiveModeReq` / `kRemoveActiveModeReq` ICD triggers via
+            // `GeneralDiagnostics::TestEventTrigger`. It defaults `enableKey` to
+            // the canonical sequence, so wire the same value into the DUT.
+            "TC_ICDM_3_1" => Some("--enable-key 000102030405060708090a0b0c0d0e0f"),
+            // TC_ICDManagementCluster invalidates the ICD Check-In counter via
+            // `GeneralDiagnostics::TestEventTrigger` with the canonical enable
+            // key; wire the same value into the DUT.
+            "TC_ICDManagementCluster" => Some("--enable-key 000102030405060708090a0b0c0d0e0f"),
             _ => None,
         }
     }
@@ -1527,8 +2584,36 @@ impl ITests {
     /// on the command line via the `--int-arg`, `--string-arg`, `--hex-arg`
     /// flags. Map them here per test, keyed by file stem, so the rest of the
     /// dispatch path stays uniform.
-    fn extra_python_script_args(test_name: &str) -> &'static str {
-        match test_name {
+    fn extra_python_script_args(test_name: &str, target: &str) -> String {
+        // Thread-suite only (`THREAD_TESTS`). The first dataset reaches
+        // `matter_test_config.thread_operational_dataset` via
+        // `--thread-dataset-hex` — kept by the framework because
+        // `--in-test-commissioning-method` is a wireless one, exactly as for
+        // `TC_CNET_4_9`/`4_10` below; commissioning itself is still
+        // on-network. The second dataset is read with `user_params.get()`
+        // followed by `bytes.fromhex()`, so it must arrive as a hex *string*
+        // (`--string-arg`, not `--hex-arg`). Composed at runtime from the
+        // dataset consts — the only entry that cannot be a `'static` literal.
+        // Against the real-otbr `thread_tests` driver, the Thread CNET tests
+        // are handed the suite's REAL dataset; the mock xpan-only TLV in the
+        // static arm below belongs to `MockNetCtl`'s canned network and is
+        // what the same tests receive in the `wireless` suite.
+        if target == THREAD_TARGET && matches!(test_name, "TC_CNET_4_10" | "TC_CNET_4_16") {
+            return format!(
+                "--endpoint 0 --in-test-commissioning-method ble-thread \
+                 --thread-dataset-hex {THREAD_DATASET_1}"
+            );
+        }
+
+        if test_name == "TC_CNET_4_12" {
+            return format!(
+                "--endpoint 0 --in-test-commissioning-method ble-thread \
+                 --thread-dataset-hex {THREAD_DATASET_1} \
+                 --string-arg PIXIT.CNET.THREAD_2ND_OPERATIONALDATASET:{THREAD_DATASET_2}"
+            );
+        }
+
+        let args: &'static str = match test_name {
             // TC_ACE_1_4 needs the PIXITs that point at the application
             // endpoint/cluster/attribute exposed by `system_tests`. Endpoint 1
             // hosts the OnOff cluster on a `DEV_TYPE_ON_OFF_LIGHT` (device type
@@ -1546,6 +2631,12 @@ impl ITests {
             // ACL events. argparse keeps the last `--endpoint`, so appending
             // here wins.
             "TC_ACL_2_6" | "TC_ACL_2_7" | "TC_ACL_2_8" => "--endpoint 0",
+            // These ICDM tests read/write the AccessControl cluster (to drop the
+            // TH to Manage privilege) via `get_endpoint()`, which defaults to the
+            // `--endpoint 1` we pass for application tests. AccessControl lives on
+            // the root endpoint, so pin the default there. The ICDM helpers
+            // themselves already target endpoint 0 explicitly.
+            "TC_ICDM_3_2" | "TC_ICDM_3_3" | "TC_ICDM_3_4" => "--endpoint 0",
             // TC_CGEN_2_2 lives on the root endpoint (GeneralCommissioning /
             // OperationalCredentials clusters) and uses
             // `PIXIT.CGEN.FailsafeExpiryLengthSeconds` to bound the fail-safe
@@ -1573,6 +2664,33 @@ impl ITests {
                  --PICS src/app/tests/suites/certification/ci-pics-values"
             }
             "TC_CGEN_2_4" => "--endpoint 0",
+            // The wireless Network Commissioning tests read the network they
+            // expect the DUT to be provisioned with out of the commissioning
+            // arguments, even when - as here - the node was commissioned
+            // on-network. The values have to match what `wireless_tests` seeds
+            // itself with; see `MOCK_WIFI_SSID` / `MOCK_THREAD_DATASET` in
+            // `tests/src/common/mock_net_ctl.rs`.
+            //
+            // `--in-test-commissioning-method` is what makes the framework keep
+            // them: it copies the Wi-Fi / Thread credentials into the test
+            // config only when the commissioning method is a wireless one
+            // (`runner.py`, `commissioning_method = args.in_test_commissioning_method
+            // or args.commissioning_method`), otherwise they are parsed and
+            // dropped. It does not change how the node is actually commissioned
+            // - `--commissioning-method on-network` still governs that.
+            "TC_CNET_4_9" => {
+                "--endpoint 0 --in-test-commissioning-method ble-wifi \
+                 --wifi-ssid MatterAP --wifi-passphrase MatterAPPassword"
+            }
+            // `0208` is the Extended PAN ID TLV header (type 2, length 8),
+            // followed by the mock network's Extended PAN ID.
+            "TC_CNET_4_10" | "TC_CNET_4_16" => {
+                "--endpoint 0 --in-test-commissioning-method ble-thread \
+                 --thread-dataset-hex 0208123456789abcdef0"
+            }
+            // Gates on `MCORE.ROLE.COMMISSIONEE` + `G.S`; `--endpoint 1` is
+            // `PIXIT.G.ENDPOINT` (the default script args already carry it).
+            "TC_ACE_1_6" => "--PICS src/app/tests/suites/certification/ci-pics-values",
             // TC_CGEN_2_5..2_11 verify the General Commissioning
             // *Terms-and-Conditions* (TC, Matter 1.4+, `CGEN.S.F00`)
             // feature. rs-matter does not implement TC, and each test body
@@ -1609,6 +2727,31 @@ impl ITests {
                  --PICS src/app/tests/suites/certification/ci-pics-values \
                  --app-pipe /tmp/rs_matter_bin_info_3_2_fifo"
             }
+            // `TC_SWTCH` targets the `light_tests` Generic Switch endpoint
+            // and takes its button-simulator path only when
+            // `PICS_SDK_CI_ONLY` is set (else it prompts an operator). The
+            // `--app-pipe` path is mirrored on the DUT side via
+            // `app_args_override`.
+            "TC_SWTCH" => {
+                "--endpoint 3 \
+                 --PICS src/app/tests/suites/certification/ci-pics-values \
+                 --app-pipe /tmp/rs_matter_swtch_fifo"
+            }
+            // `test_TC_IDM_10_5` flags every server cluster that is not part of
+            // some device type declared on its endpoint. `system_tests` hosts
+            // `Groups` on EP0 so `TestGroupMessaging` can group-address writes
+            // to `BasicInformation::NodeLabel` (group membership is
+            // per-endpoint, per App Cluster spec 1.3), and no device type grants
+            // `Groups` on a root node - so this cannot be resolved by declaring
+            // more device types, the way the OTA clusters were.
+            //
+            // Matter Core spec 7.16.4 permits extra clusters on an endpoint;
+            // the checker is strict by default and parameterised for exactly
+            // this case. CHIP's own `all-clusters-app` is in the same position
+            // (its EP0 declares only `ma_rootdevice` + `ma_powersource`, yet
+            // hosts `Groups`), which is why upstream provides the knob. With it
+            // off, such findings are recorded as warnings rather than errors.
+            "TC_DeviceConformance" => "--bool-arg fail_on_extra_clusters:false",
             // TC_OPCREDS_3_8 reads `NOCs` non-fabric-filtered with two
             // fabrics, each carrying a max-sized 400-byte VVSC; the
             // resulting payload is well past one MTU and rs-matter falls
@@ -1647,9 +2790,30 @@ impl ITests {
             | "TC_SC_3_4"
             | "TC_SC_3_6"
             | "TC_SC_4_3"
+            // IDM_2_3 batch-reads `BasicInformation` et al on the root endpoint;
+            // CADMIN_1_10 reads `SpecificationVersion` there.
+            | "TC_IDM_2_3"
+            | "TC_CADMIN_1_10"
+            // CNET (Network Commissioning) is served on the root endpoint;
+            // the `@run_if_endpoint_matches(has_feature(...))` gates on these
+            // find the Ethernet / Wi-Fi / Thread feature only there, and would
+            // otherwise skip (which `--fail-on-skipped` turns into a failure).
+            | "TC_CNET_4_3"
+            | "TC_CNET_4_1"
+            | "TC_CNET_4_2"
+            | "TC_CNET_4_4"
+            | "TC_CNET_4_15"
+            | "TC_CNET_4_22"
             // DGGEN (General Diagnostics) lives on the root endpoint.
             | "TC_DGGEN_2_4"
+            | "TC_DGGEN_2_5"
             | "TC_DGGEN_3_2"
+            // BINFO (Basic Information) lives on the root endpoint.
+            | "TC_BINFO_2_1"
+            | "TC_BINFO_2_2"
+            | "TC_BINFO_3_1"
+            // PS (Power Source) is hosted on the root endpoint.
+            | "TC_PS_2_3"
             // DGSW (Software Diagnostics) lives on the root endpoint
             // — `@run_if_endpoint_matches(has_cluster(SoftwareDiagnostics))`
             // skips unless we point the runner at EP0.
@@ -1681,6 +2845,9 @@ impl ITests {
             // `system_tests.rs`); Groups now lives on EP1/EP2 under the
             // On/Off Light device type, so target EP1.
             "TC_G_2_2" => "--endpoint 1",
+            // The Groupcast cluster lives on the root endpoint.
+            "TC_GC_2_1" | "TC_GC_2_2" | "TC_GC_2_3" | "TC_GC_2_4" | "TC_GC_2_5" | "TC_GC_2_6"
+            | "TC_GC_2_7" | "TC_GC_2_8" => "--endpoint 0",
             // TC_DA_1_7 ("device attestation: distinct keys per DUT") normally
             // requires two distinct DUTs with different DAC keys. The test
             // also supports a single-DUT mode for CI when `allow_sdk_dac:true`
@@ -1705,9 +2872,11 @@ impl ITests {
             // chip output from `cargo xtask itest-setup` and bump its
             // per-test timeout (default 90 s) past the seven 30-s commission
             // attempts the test performs.
+            // The `app_path` pointing at that binary is appended separately (see
+            // `needs_all_clusters_app_arg`), since only that path is resolved
+            // against the chip output tree rather than being a fixed literal.
             "TC_DA_1_9" => {
                 "--PICS src/app/tests/suites/certification/ci-pics-values \
-                 --string-arg app_path:out/host/chip-all-clusters-app \
                  --string-arg dac_provider_base_path:credentials/test/revoked-attestation-certificates/dac-provider-test-vectors \
                  --string-arg revocation_set_base_path:credentials/test/revoked-attestation-certificates/revocation-sets \
                  --timeout 300"
@@ -1733,7 +2902,9 @@ impl ITests {
             // endpoint 0 like the other root-endpoint SC tests.
             "TC_SC_7_1" => "--bool-arg post_cert_test:true --endpoint 0",
             _ => "",
-        }
+        };
+
+        args.to_string()
     }
 
     fn build_test_exe<'a>(
@@ -1745,7 +2916,7 @@ impl ITests {
     ) -> anyhow::Result<()> {
         warn!("Building test executable `{target}`...");
 
-        let test_exe_crate_dir = self.workspace_dir.join("examples");
+        let test_exe_crate_dir = self.workspace_dir.join(TEST_CRATE_DIR);
 
         if force_rebuild {
             info!("Force rebuild requested, cleaning previous build artifacts...");
@@ -1798,9 +2969,21 @@ impl ITests {
         self.workspace_dir.join("target").join(profile).join(target)
     }
 
-    fn test_pics_path(&self, target: &str) -> PathBuf {
+    fn test_pics_path(&self, test_name: &str, target: &str) -> PathBuf {
+        // The Wi-Fi/Thread flavour split (and its per-flavour `.pics`) is a
+        // `wireless_tests` concept; the same test names running against
+        // another target (e.g. `Test_TC_DGTHREAD_2_1` in the `thread` suite)
+        // use that target's own `.pics`.
+        let target = if target == "wireless_tests" {
+            WirelessFlavour::of(test_name)
+                .map(|flavour| flavour.pics_target())
+                .unwrap_or(target)
+        } else {
+            target
+        };
+
         self.workspace_dir
-            .join("examples")
+            .join(TEST_CRATE_DIR)
             .join("src")
             .join("bin")
             .join(format!("{target}.pics"))

@@ -68,7 +68,9 @@ use rs_matter::dm::clusters::decl::globals::ICECandidateStruct;
 use rs_matter::dm::clusters::decl::globals::WebRTCEndReasonEnum;
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
 use rs_matter::dm::clusters::groups::{self, ClusterHandler as _};
+use rs_matter::dm::clusters::power_source::{self, PowerSourceConfig, PowerSourceHandler};
 use rs_matter::dm::devices::test::{DAC_PRIVKEY, TEST_DEV_ATT, TEST_DEV_DET};
+use rs_matter::dm::devices::{DEV_TYPE_POWER_SOURCE, DEV_TYPE_ROOT_NODE};
 use rs_matter::dm::endpoints;
 use rs_matter::dm::networks::eth::EthNetwork;
 use rs_matter::dm::networks::SysNetifs;
@@ -88,7 +90,7 @@ use rs_matter::tlv::{TLVArray, TLVBuilderParent};
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::utils::init::InitMaybeUninit;
 use rs_matter::utils::select::Coalesce;
-use rs_matter::{clusters, devices, root_endpoint, Matter};
+use rs_matter::{clusters, devices, Matter};
 
 use static_cell::StaticCell;
 
@@ -410,15 +412,13 @@ fn main() -> Result<(), Error> {
     let buffers = BUFFERS.uninit().init_with(MatterBuffers::init());
 
     // Create the data model state (subscriptions, events, network store).
-    let mut state: EthInteractionModelState =
-        EthInteractionModelState::new(EthNetwork::new_default());
+    let state: EthInteractionModelState = EthInteractionModelState::new(EthNetwork::new_default());
 
     // Bind the KV access object (the KV scratch buffer lives in `Matter`).
     let kv = matter.kv(store);
 
-    // Re-hydrate the `Matter` instance and the data model state (event-number epoch).
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
-    futures_lite::future::block_on(state.load_persist(&kv))?;
+    // Re-hydrate the `Matter` instance (fabrics, basic info, RTC).
+    matter.startup(&kv)?;
 
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
     let mut rand = crypto.rand()?;
@@ -580,6 +580,10 @@ fn main() -> Result<(), Error> {
         &state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state and deliver the `Startup` lifecycle op to all cluster handlers.
+    futures_lite::future::block_on(im.startup())?;
+
     let responder = DefaultResponder::new(&im);
     let mut respond = pin!(responder.run::<4, 4>());
     let mut im_job = pin!(im.run());
@@ -599,7 +603,7 @@ fn main() -> Result<(), Error> {
 
     matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
         matter.open_basic_comm_window(MAX_COMM_WINDOW_TIMEOUT_SECS, &crypto, &())?;
     }
@@ -641,9 +645,25 @@ const BASIC_INFO: BasicInfoConfig<'static> = BasicInfoConfig {
 // Node
 // ---------------------------------------------------------------------------
 
+/// The camera is mains-powered. Hosting `PowerSource` at all is what lets a
+/// controller *ask* - `TC_WEBRTCP_2_1` gates its standby-flow steps on
+/// `PowerSource.FeatureMap & BATTERY`, and with no cluster present that read
+/// fails outright instead of answering "not a battery".
+const POWER_SOURCE: PowerSourceConfig = PowerSourceConfig {
+    description: "Mains",
+    ..PowerSourceConfig::MAINS
+};
+
 const NODE: Node<'static> = Node {
     endpoints: &[
-        root_endpoint!(eth),
+        Endpoint {
+            id: endpoints::ROOT_ENDPOINT_ID,
+            device_types: devices!(DEV_TYPE_ROOT_NODE, DEV_TYPE_POWER_SOURCE),
+            clusters: clusters!(eth; power_source::CLUSTER),
+            client_clusters: &[],
+            unique_id: None,
+            semantic_tags: &[],
+        },
         Endpoint::new(
             1,
             devices!(DEV_TYPE_MATTER_CAMERA),
@@ -720,6 +740,13 @@ fn data_model<'a>(
             .chain(
                 EpClMatcher::new(Some(1), Some(chime_decl::FULL_CLUSTER.id)),
                 Async(ChimeHandlerAdaptor(chime)),
+            )
+            .chain(
+                EpClMatcher::new(
+                    Some(endpoints::ROOT_ENDPOINT_ID),
+                    Some(power_source::CLUSTER.id),
+                ),
+                Async(PowerSourceHandler::new(Dataver::new_rand(&mut rand), &POWER_SOURCE).adapt()),
             ),
     )
 }

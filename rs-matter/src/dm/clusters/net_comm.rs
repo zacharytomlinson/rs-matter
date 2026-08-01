@@ -21,6 +21,7 @@ use core::fmt::{self, Debug};
 use core::future::{ready, Future};
 
 use crate::dm::clusters::gen_comm::GenCommHandler;
+use crate::dm::clusters::wifi_diag::WirelessDiag;
 use crate::dm::networks::wireless::{Thread, ThreadTLV, MAX_WIRELESS_NETWORK_ID_LEN};
 use crate::dm::networks::NetChangeNotif;
 use crate::dm::{ArrayAttributeRead, Cluster, Dataver, InvokeContext, ReadContext, WriteContext};
@@ -37,7 +38,6 @@ use crate::utils::sync::{DynBase, Notification};
 use crate::with;
 
 pub use crate::dm::clusters::decl::network_commissioning::*;
-pub use crate::dm::clusters::groups;
 
 /// Network type supported by the `NetCtl` implementations
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -68,29 +68,29 @@ impl NetworkType {
     }
 }
 
-/// Network information as returned by the `Networks` trait
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct NetworkInfo<'a> {
-    /// The network ID of the network
-    pub network_id: &'a [u8],
-    /// Whether this network is currently connected
-    pub connected: bool,
-}
-
-impl NetworkInfo<'_> {
-    /// Read the network information into the given `NetworkInfoStructBuilder`.
-    fn read_into<P: TLVBuilderParent>(
-        &self,
-        builder: NetworkInfoStructBuilder<P>,
-    ) -> Result<P, Error> {
-        builder
-            .network_id(Octets::new(self.network_id))?
-            .connected(self.connected)?
-            .network_identifier(None)?
-            .client_identifier(None)?
-            .end()
-    }
+/// Read one entry of the `Networks` attribute into the given builder.
+///
+/// `connected` is not something the `Networks` store can answer - it is the
+/// network *controller* that knows which network is currently up - so it is
+/// supplied by the caller (see `NetCommHandler::networks`) rather than carried
+/// alongside the network ID.
+fn network_read_into<P: TLVBuilderParent>(
+    network_id: &[u8],
+    connected: bool,
+    builder: NetworkInfoStructBuilder<P>,
+) -> Result<P, Error> {
+    // `NetworkIdentifier` / `ClientIdentifier` are not part of
+    // `NetworkInfoStruct` in the Matter 1.6.0 data model: the Wi-Fi
+    // per-device-credentials surface moved to the separate
+    // `NetworkIdentityManagement` cluster. They exist again in the 1.6.1
+    // IDL, so the two lines below are kept, commented, to be restored
+    // together with `CSA_STANDARD_CLUSTERS_IDL_V1_6_1_0`.
+    builder
+        .network_id(Octets::new(network_id))?
+        .connected(connected)?
+        // .network_identifier(None)?
+        // .client_identifier(None)?
+        .end()
 }
 
 /// Network scan information as returned by the `NetCtl::scan` method
@@ -371,12 +371,15 @@ impl NetworkCommissioningStatusEnum {
         index: Option<u8>,
         builder: NetworkConfigResponseBuilder<P>,
     ) -> Result<P, Error> {
+        // As with `NetworkInfoStruct`, `ClientIdentity` / `PossessionSignature`
+        // left `NetworkConfigResponse` in the 1.6.0 data model. Kept commented
+        // for the eventual move back to 1.6.1.
         builder
             .networking_status(*self)?
             .debug_text(None)?
             .network_index(index)?
-            .client_identity(None)?
-            .possession_signature(None)?
+            // .client_identity(None)?
+            // .possession_signature(None)?
             .end()
     }
 }
@@ -389,7 +392,7 @@ pub trait Networks {
     fn max_networks(&self) -> Result<u8, Error>;
 
     /// Iterate over the networks recorded in the implementation and call the provided function for each network
-    fn networks(&self, f: &mut dyn FnMut(&NetworkInfo) -> Result<(), Error>) -> Result<(), Error>;
+    fn networks(&self, f: &mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error>;
 
     /// Get the credentials for the given network ID by calling the provided function
     ///
@@ -453,11 +456,32 @@ pub trait Networks {
     /// Return the index of the network ID if it was removed, or an error if the operation failed.
     fn remove(&mut self, network_id: &[u8]) -> Result<u8, NetworksError>;
 
-    /// Return whether the network interface is commissioned
-    fn commissioned(&self) -> Result<bool, Error>;
+    /// Return whether the networks store is in "managed" state.
+    ///
+    /// Managed means: the store holds *committed* operational network
+    /// configuration, and the operational connectivity manager
+    /// (`WirelessMgr`) may act on it. The store starts unmanaged (never
+    /// commissioned, empty), and temporarily *becomes* unmanaged again while
+    /// network changes are staged under an armed fail-safe (any successful
+    /// `AddOrUpdate*Network` / `RemoveNetwork` / `ReorderNetwork` /
+    /// `ConnectNetwork` flips it to `false`) - during such a window the
+    /// commissioner drives connectivity explicitly, and the manager must
+    /// stand down.
+    ///
+    /// The state comes back to managed on either exit from the window:
+    /// - commit: `CommissioningComplete` calls `set_managed(true)` and
+    ///   persists the store;
+    /// - revert: the fail-safe expiry reloads the persisted store, which
+    ///   always carries the committed - hence managed - state.
+    ///
+    /// Note that a window which stages no network changes (e.g. opened only
+    /// to commission an additional fabric) leaves the store managed, so
+    /// connectivity maintenance of the operational network continues
+    /// throughout - matching CHIP's behavior.
+    fn managed(&self) -> Result<bool, Error>;
 
-    /// Set the commissioned state of the network interface
-    fn set_commissioned(&mut self, commissioned: bool) -> Result<(), Error>;
+    /// Set the managed state of the networks store (see `managed`).
+    fn set_managed(&mut self, managed: bool) -> Result<(), Error>;
 
     /// Reset the networks to the initial state, removing all recorded network credentials
     fn reset(&mut self) -> Result<(), Error>;
@@ -478,7 +502,7 @@ where
         (**self).max_networks()
     }
 
-    fn networks(&self, f: &mut dyn FnMut(&NetworkInfo) -> Result<(), Error>) -> Result<(), Error> {
+    fn networks(&self, f: &mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
         (**self).networks(f)
     }
 
@@ -518,12 +542,12 @@ where
         (*self).remove(network_id)
     }
 
-    fn commissioned(&self) -> Result<bool, Error> {
-        (**self).commissioned()
+    fn managed(&self) -> Result<bool, Error> {
+        (**self).managed()
     }
 
-    fn set_commissioned(&mut self, commissioned: bool) -> Result<(), Error> {
-        (**self).set_commissioned(commissioned)
+    fn set_managed(&mut self, managed: bool) -> Result<(), Error> {
+        (**self).set_managed(managed)
     }
 
     fn reset(&mut self) -> Result<(), Error> {
@@ -544,7 +568,7 @@ impl Networks for &mut dyn Networks {
         (**self).max_networks()
     }
 
-    fn networks(&self, f: &mut dyn FnMut(&NetworkInfo) -> Result<(), Error>) -> Result<(), Error> {
+    fn networks(&self, f: &mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
         (**self).networks(f)
     }
 
@@ -584,12 +608,12 @@ impl Networks for &mut dyn Networks {
         (**self).remove(network_id)
     }
 
-    fn commissioned(&self) -> Result<bool, Error> {
-        (**self).commissioned()
+    fn managed(&self) -> Result<bool, Error> {
+        (**self).managed()
     }
 
-    fn set_commissioned(&mut self, commissioned: bool) -> Result<(), Error> {
-        (**self).set_commissioned(commissioned)
+    fn set_managed(&mut self, managed: bool) -> Result<(), Error> {
+        (**self).set_managed(managed)
     }
 
     fn reset(&mut self) -> Result<(), Error> {
@@ -633,7 +657,7 @@ impl Networks for DummyNetworks {
         Ok(0)
     }
 
-    fn networks(&self, _f: &mut dyn FnMut(&NetworkInfo) -> Result<(), Error>) -> Result<(), Error> {
+    fn networks(&self, _f: &mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
         Ok(())
     }
 
@@ -673,11 +697,11 @@ impl Networks for DummyNetworks {
         Err(NetworksError::Other(ErrorCode::InvalidAction.into()))
     }
 
-    fn commissioned(&self) -> Result<bool, Error> {
+    fn managed(&self) -> Result<bool, Error> {
         Ok(false)
     }
 
-    fn set_commissioned(&mut self, _commissioned: bool) -> Result<(), Error> {
+    fn set_managed(&mut self, _managed: bool) -> Result<(), Error> {
         Ok(())
     }
 
@@ -858,13 +882,25 @@ impl<N> SharedNetworks<N> {
     pub fn init(networks: impl Init<N>) -> impl Init<Self> {
         init!(Self {
             state <- Mutex::init(RefCell::init(networks)),
-            state_changed: Notification::new(),
+            state_changed <- Notification::init(),
         })
     }
 
     /// Get a mutable reference to the inner `Networks` implementation.
     pub fn get_mut(&mut self) -> &mut RefCell<N> {
         self.state.get_mut()
+    }
+
+    /// Run a closure with mutable access to the raw inner `Networks`
+    /// implementation, without firing a change notification.
+    ///
+    /// Used by the startup / factory-reset persistence paths, where nothing is
+    /// subscribed to changes yet (or the notification is meaningless).
+    pub(crate) fn with_raw<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut N) -> R,
+    {
+        self.state.lock(|state| f(&mut state.borrow_mut()))
     }
 
     /// Wait for the state to change.
@@ -910,7 +946,7 @@ impl Networks for SharedNetworksInstance<'_> {
         self.networks.max_networks()
     }
 
-    fn networks(&self, f: &mut dyn FnMut(&NetworkInfo) -> Result<(), Error>) -> Result<(), Error> {
+    fn networks(&self, f: &mut dyn FnMut(&[u8]) -> Result<(), Error>) -> Result<(), Error> {
         self.networks.networks(f)
     }
 
@@ -966,12 +1002,12 @@ impl Networks for SharedNetworksInstance<'_> {
         Ok(index)
     }
 
-    fn commissioned(&self) -> Result<bool, Error> {
-        self.networks.commissioned()
+    fn managed(&self) -> Result<bool, Error> {
+        self.networks.managed()
     }
 
-    fn set_commissioned(&mut self, commissioned: bool) -> Result<(), Error> {
-        self.networks.set_commissioned(commissioned)?;
+    fn set_managed(&mut self, managed: bool) -> Result<(), Error> {
+        self.networks.set_managed(managed)?;
 
         self.changed.notify();
 
@@ -987,7 +1023,17 @@ impl Networks for SharedNetworksInstance<'_> {
     }
 
     fn load(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.networks.load(data)
+        self.networks.load(data)?;
+
+        // As for every other mutator: `load` replaces the whole store state.
+        // It is notably how the fail-safe expiry *reverts* staged network
+        // changes (reloading the committed blob from the KV store) - without
+        // the notification, a `WirelessMgr` parked on the store would sleep
+        // through the revert and never reconcile connectivity with the
+        // restored networks.
+        self.changed.notify();
+
+        Ok(())
     }
 
     fn save(&self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
@@ -999,15 +1045,69 @@ impl Networks for SharedNetworksInstance<'_> {
 
 /// The system implementation of a handler for the Network Commissioning Matter cluster.
 #[derive(Clone)]
-pub struct NetCommHandler<T> {
+pub struct NetCommHandler<'a, T> {
     dataver: Dataver,
     net_ctl: T,
+    /// Tells whether the node currently has a network up. Combined with the
+    /// last-connected network ID from `NetCtlStatus`, this is what the
+    /// `Connected` field of each `Networks` entry is derived from - the
+    /// `Networks` store itself has no way of knowing.
+    wireless_diag: &'a dyn WirelessDiag,
 }
 
-impl<T> NetCommHandler<T> {
-    /// Create a new instance of `NetCommHandler` with the given `Dataver` and `NetCtl`.
-    pub const fn new(dataver: Dataver, net_ctl: T) -> Self {
-        Self { dataver, net_ctl }
+impl<'a, T> NetCommHandler<'a, T> {
+    /// Create a new instance of `NetCommHandler` with the given `Dataver`,
+    /// `NetCtl` and `WirelessDiag`.
+    pub const fn new(dataver: Dataver, net_ctl: T, wireless_diag: &'a dyn WirelessDiag) -> Self {
+        Self {
+            dataver,
+            net_ctl,
+            wireless_diag,
+        }
+    }
+
+    /// Apply the `Breadcrumb` field of a Network Commissioning command.
+    ///
+    /// The field is optional, and only a command that *succeeded* may touch the
+    /// `GeneralCommissioning::Breadcrumb` attribute - a failed command has to
+    /// leave it exactly as it was.
+    fn apply_breadcrumb(
+        ctx: &impl InvokeContext,
+        status: NetworkCommissioningStatusEnum,
+        breadcrumb: Option<u64>,
+    ) -> Result<(), Error> {
+        if !matches!(status, NetworkCommissioningStatusEnum::Success) {
+            return Ok(());
+        }
+
+        let Some(breadcrumb) = breadcrumb else {
+            return Ok(());
+        };
+
+        ctx.exchange().with_state(|state| {
+            state.failsafe.set_breadcrumb(breadcrumb);
+
+            Ok(())
+        })
+    }
+
+    /// Whether the `Networks` attribute currently has any entry.
+    ///
+    /// `LastNetworkingStatus`, `LastNetworkID` and `LastConnectErrorValue` all
+    /// read as null while no network configurations exist, regardless of what
+    /// happened before the last one was removed.
+    fn has_networks(ctx: &impl ReadContext) -> Result<bool, Error> {
+        ctx.networks().access(|networks| {
+            let mut any = false;
+
+            networks.networks(&mut |_| {
+                any = true;
+
+                Ok(())
+            })?;
+
+            Ok(any)
+        })
     }
 
     /// Adapt the handler instance to the generic `rs-matter` `AsyncHandler` trait
@@ -1016,7 +1116,7 @@ impl<T> NetCommHandler<T> {
     }
 }
 
-impl<T> ClusterAsyncHandler for NetCommHandler<T>
+impl<T> ClusterAsyncHandler for NetCommHandler<'_, T>
 where
     T: NetCtl + NetCtlStatus,
 {
@@ -1112,12 +1212,30 @@ where
         ctx: impl ReadContext,
         builder: ArrayAttributeRead<NetworkInfoStructArrayBuilder<P>, NetworkInfoStructBuilder<P>>,
     ) -> impl Future<Output = Result<P, Error>> {
+        // A network reads as connected when the node has a network up *and* the
+        // last network it connected to is this one. The liveness half has to
+        // come from the diagnostics hook rather than `LastNetworkingStatus`,
+        // which records the last operation and stays `Success` even after the
+        // link has since dropped.
+        let connected = |network_id: &[u8]| -> Result<bool, Error> {
+            if !self.wireless_diag.connected()? {
+                return Ok(false);
+            }
+
+            self.net_ctl
+                .last_network_id(|last| Ok(last == Some(network_id)))
+        };
+
         ready(ctx.networks().access(|networks| match builder {
             ArrayAttributeRead::ReadAll(builder) => builder.with(|builder| {
                 let mut builder = Some(builder);
 
-                networks.networks(&mut |ni| {
-                    builder = Some(ni.read_into(unwrap!(builder.take()).push()?)?);
+                networks.networks(&mut |network_id| {
+                    builder = Some(network_read_into(
+                        network_id,
+                        connected(network_id)?,
+                        unwrap!(builder.take()).push()?,
+                    )?);
 
                     Ok(())
                 })?;
@@ -1129,9 +1247,13 @@ where
                 let mut builder = Some(builder);
                 let mut parent = None;
 
-                networks.networks(&mut |ni| {
+                networks.networks(&mut |network_id| {
                     if current == index {
-                        parent = Some(ni.read_into(unwrap!(builder.take()))?);
+                        parent = Some(network_read_into(
+                            network_id,
+                            connected(network_id)?,
+                            unwrap!(builder.take()),
+                        )?);
                     }
 
                     current += 1;
@@ -1158,30 +1280,48 @@ where
 
     fn last_networking_status(
         &self,
-        _ctx: impl ReadContext,
+        ctx: impl ReadContext,
     ) -> impl Future<Output = Result<Nullable<NetworkCommissioningStatusEnum>, Error>> {
-        ready(self.net_ctl.last_networking_status().map(Nullable::new))
+        ready((|| {
+            if !Self::has_networks(&ctx)? {
+                return Ok(Nullable::none());
+            }
+
+            self.net_ctl.last_networking_status().map(Nullable::new)
+        })())
     }
 
     fn last_network_id<P: TLVBuilderParent>(
         &self,
-        _ctx: impl ReadContext,
+        ctx: impl ReadContext,
         builder: NullableBuilder<P, OctetsBuilder<P>>,
     ) -> impl Future<Output = Result<P, Error>> {
-        ready(self.net_ctl.last_network_id(|network_id| {
-            if let Some(network_id) = network_id {
-                builder.non_null()?.set(Octets::new(network_id))
-            } else {
-                builder.null()
+        ready((|| {
+            if !Self::has_networks(&ctx)? {
+                return builder.null();
             }
-        }))
+
+            self.net_ctl.last_network_id(|network_id| {
+                if let Some(network_id) = network_id {
+                    builder.non_null()?.set(Octets::new(network_id))
+                } else {
+                    builder.null()
+                }
+            })
+        })())
     }
 
     fn last_connect_error_value(
         &self,
-        _ctx: impl ReadContext,
+        ctx: impl ReadContext,
     ) -> impl Future<Output = Result<Nullable<i32>, Error>> {
-        ready(self.net_ctl.last_connect_error_value().map(Nullable::new))
+        ready((|| {
+            if !Self::has_networks(&ctx)? {
+                return Ok(Nullable::none());
+            }
+
+            self.net_ctl.last_connect_error_value().map(Nullable::new)
+        })())
     }
 
     async fn set_interface_enabled(
@@ -1211,7 +1351,7 @@ where
 
     async fn handle_scan_networks<P: TLVBuilderParent>(
         &self,
-        _ctx: impl InvokeContext,
+        ctx: impl InvokeContext,
         request: ScanNetworksRequest<'_>,
         response: ScanNetworksResponseBuilder<P>,
     ) -> Result<P, Error> {
@@ -1249,6 +1389,8 @@ where
                         .await
                         .map(|_| 0),
                 )?;
+
+                Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
 
                 if let Some(builder) = builder {
                     builder
@@ -1295,6 +1437,8 @@ where
                         .map(|_| 0),
                 )?;
 
+                Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
+
                 if let Some(builder) = builder {
                     builder
                         .networking_status(status)?
@@ -1335,6 +1479,8 @@ where
             }),
         )?;
 
+        Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
+
         // Networks list mutated
         ctx.notify_own_cluster_changed();
 
@@ -1359,6 +1505,8 @@ where
             }),
         )?;
 
+        Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
+
         // Networks list mutated
         ctx.notify_own_cluster_changed();
 
@@ -1380,6 +1528,8 @@ where
                 })
             }),
         )?;
+
+        Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
 
         // Networks list mutated
         ctx.notify_own_cluster_changed();
@@ -1405,7 +1555,7 @@ where
                 let (mut status, mut err_code, _) = NetworkCommissioningStatusEnum::map(
                     GenCommHandler::with_armed_failsafe_ex(&ctx, |_, _| {
                         ctx.networks().access(|networks| {
-                            networks.creds(request.network_id()?.0, &mut |creds| {
+                            let index = networks.creds(request.network_id()?.0, &mut |creds| {
                                 let WirelessCreds::Thread { dataset_tlv } = creds else {
                                     error!("Thread creds expected");
                                     return Err(ErrorCode::InvalidAction.into());
@@ -1420,7 +1570,16 @@ where
                                 dataset_len = dataset_tlv.len();
 
                                 Ok(())
-                            })
+                            })?;
+
+                            // `ConnectNetwork` is a staged, fail-safe-gated
+                            // change like the list mutations: flip the store
+                            // to unmanaged so the `WirelessMgr` stands down
+                            // for the rest of the window instead of racing
+                            // the connect we are about to perform.
+                            networks.set_managed(false)?;
+
+                            Ok(index)
                         })
                     }),
                 )?;
@@ -1446,7 +1605,7 @@ where
                 let (mut status, mut err_code, _) = NetworkCommissioningStatusEnum::map(
                     GenCommHandler::with_armed_failsafe_ex(&ctx, |_, _| {
                         ctx.networks().access(|networks| {
-                            networks.creds(request.network_id()?.0, &mut |creds| {
+                            let index = networks.creds(request.network_id()?.0, &mut |creds| {
                                 let WirelessCreds::Wifi { ssid, pass } = creds else {
                                     error!("Wifi creds expected");
                                     return Err(ErrorCode::InvalidAction.into());
@@ -1468,7 +1627,13 @@ where
                                 pass_len = pass.len();
 
                                 Ok(())
-                            })
+                            })?;
+
+                            // As for the Thread branch: `ConnectNetwork` is a
+                            // staged, fail-safe-gated change.
+                            networks.set_managed(false)?;
+
+                            Ok(index)
                         })
                     }),
                 )?;
@@ -1490,6 +1655,8 @@ where
                 return Err(ErrorCode::InvalidAction.into());
             }
         };
+
+        Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
 
         // LastNetworkingStatus / LastNetworkID / LastConnectErrorValue mutated
         ctx.notify_own_cluster_changed();
@@ -1518,23 +1685,32 @@ where
             }),
         )?;
 
+        Self::apply_breadcrumb(&ctx, status, request.breadcrumb()?)?;
+
         // Networks order mutated
         ctx.notify_own_cluster_changed();
 
         status.read_into(index, response)
     }
 
-    fn handle_query_identity<P: TLVBuilderParent>(
-        &self,
-        _ctx: impl InvokeContext,
-        _request: QueryIdentityRequest<'_>,
-        _response: QueryIdentityResponseBuilder<P>,
-    ) -> impl Future<Output = Result<P, Error>> {
-        ready(Err(ErrorCode::CommandNotFound.into()))
-    }
+    // `QueryIdentity` is not a `NetworkCommissioning` command in the Matter
+    // 1.6.0 data model - it moved to the new (provisional)
+    // `NetworkIdentityManagement` cluster, along with the rest of the Wi-Fi
+    // per-device-credentials surface. The 1.6.1 IDL has it back on this
+    // cluster, so the implementation is kept here, commented, to be restored
+    // together with `CSA_STANDARD_CLUSTERS_IDL_V1_6_1_0`.
+    //
+    // fn handle_query_identity<P: TLVBuilderParent>(
+    //     &self,
+    //     _ctx: impl InvokeContext,
+    //     _request: QueryIdentityRequest<'_>,
+    //     _response: QueryIdentityResponseBuilder<P>,
+    // ) -> impl Future<Output = Result<P, Error>> {
+    //     ready(Err(ErrorCode::CommandNotFound.into()))
+    // }
 }
 
-impl<T> Debug for NetCommHandler<T> {
+impl<T> Debug for NetCommHandler<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NetCommHandler")
             .field("dataver", &self.dataver.get())
@@ -1543,7 +1719,7 @@ impl<T> Debug for NetCommHandler<T> {
 }
 
 #[cfg(feature = "defmt")]
-impl<T> defmt::Format for NetCommHandler<T> {
+impl<T> defmt::Format for NetCommHandler<'_, T> {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(f, "NetCommHandler {{ dataver: {} }}", self.dataver.get());
     }

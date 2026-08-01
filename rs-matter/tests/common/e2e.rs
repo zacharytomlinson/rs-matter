@@ -24,12 +24,13 @@ use embassy_sync::zerocopy_channel::{Channel, Receiver, Sender};
 
 use rs_matter::acl::{AclEntry, AuthMode};
 use rs_matter::crypto::{test_only_crypto, Crypto};
+use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::dm::clusters::net_comm::DummyNetworks;
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::dm::{DataModel, Privilege};
 use rs_matter::error::Error;
 use rs_matter::im::{InteractionModel, InteractionModelState};
-use rs_matter::persist::DummyKvBlobStore;
+use rs_matter::persist::{DummyKvBlobStore, KvBlobStore};
 use rs_matter::respond::{ExchangeHandler, Responder};
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::transport::exchange::MatterBuffers;
@@ -58,6 +59,20 @@ pub fn new_default_runner() -> E2eRunner<impl Crypto> {
 /// Create a new runner with the given category IDs.
 pub fn new_runner(cat_ids: NocCatIds) -> E2eRunner<impl Crypto> {
     E2eRunner::new(test_only_crypto(), cat_ids)
+}
+
+/// Create a new runner with default category IDs whose device-under-test
+/// serves the given `BasicInfoConfig` instead of `TEST_DEV_DET`.
+///
+/// For tests exercising configuration-derived behavior (e.g. the
+/// `BasicInfoConfig` factory defaults for `Location` / `DeviceLocation`).
+// The `common` module is shared by several test binaries; this helper is
+// used only by `data_model_tests`.
+#[allow(unused)]
+pub fn new_default_runner_with_dev_det(
+    dev_det: &'static BasicInfoConfig<'static>,
+) -> E2eRunner<impl Crypto> {
+    E2eRunner::new_with_dev_det(test_only_crypto(), NocCatIds::default(), dev_det)
 }
 
 // Set large enough that we can store more events than fit in an ethernet frame, so we can test "long reads"
@@ -92,9 +107,19 @@ impl<C: Crypto> E2eRunner<C> {
 
     /// Create a new runner with the given category IDs.
     pub fn new(crypto: C, cat_ids: NocCatIds) -> E2eRunner<C> {
+        Self::new_with_dev_det(crypto, cat_ids, &TEST_DEV_DET)
+    }
+
+    /// Like [`Self::new`], but the device-under-test `Matter` instance
+    /// serves the given `BasicInfoConfig` instead of `TEST_DEV_DET`.
+    pub fn new_with_dev_det(
+        crypto: C,
+        cat_ids: NocCatIds,
+        dev_det: &'static BasicInfoConfig<'static>,
+    ) -> E2eRunner<C> {
         E2eRunner {
-            matter: Self::new_matter(),
-            matter_client: Self::new_matter(),
+            matter: Self::new_matter(dev_det),
+            matter_client: Self::new_matter(&TEST_DEV_DET),
             crypto,
             buffers: MatterBuffers::new(),
             state: InteractionModelState::new(DummyNetworks),
@@ -164,7 +189,37 @@ impl<C: Crypto> E2eRunner<C> {
     where
         H: DataModel,
     {
+        self.run_with(handler, &self.state, DummyKvBlobStore, false)
+            .await
+    }
+
+    /// Like [`run`](Self::run), but drives the remote (tested) data model over
+    /// an explicit [`InteractionModelState`] and key-value store, and optionally
+    /// resumes persisted subscriptions before serving traffic.
+    ///
+    /// This is what makes a reboot testable: run once to establish + persist a
+    /// subscription (into a retained `kv`), then run again with a *fresh* state
+    /// and `resume = true` over the *same* `kv` to re-hydrate it — the moral
+    /// equivalent of the device restarting with its storage intact.
+    pub async fn run_with<H, S, K, const NS: usize, const NE: usize>(
+        &self,
+        handler: H,
+        state: &InteractionModelState<S, NS, NE>,
+        kv_store: K,
+        resume: bool,
+    ) -> Result<(), Error>
+    where
+        H: DataModel,
+        S: rs_matter::dm::clusters::net_comm::Networks,
+        K: KvBlobStore,
+    {
         self.init()?;
+
+        // The e2e fixtures assert exact event queues; the boot-time
+        // `BasicInformation::StartUp` emission is covered end-to-end by the
+        // chip-tool integration tests (`TC_BINFO_2_2`), so keep it out of the
+        // deterministic unit expectations here.
+        state.suppress_start_up_event();
 
         let mut buf1 = [heapless::Vec::new(); 1];
         let mut buf2 = [heapless::Vec::new(); 1];
@@ -177,7 +232,7 @@ impl<C: Crypto> E2eRunner<C> {
 
         let matter_client = &self.matter_client;
 
-        let kv = self.matter.kv(DummyKvBlobStore);
+        let kv = self.matter.kv(kv_store);
 
         let dm = InteractionModel::new(
             &self.matter,
@@ -185,8 +240,15 @@ impl<C: Crypto> E2eRunner<C> {
             &self.buffers,
             handler,
             &kv,
-            &self.state,
+            state,
         );
+
+        if resume {
+            // The moral equivalent of the device rebooting with its storage
+            // intact: re-hydrate the IM state, replay the persisted
+            // subscriptions and deliver `LifecycleOp::Startup` to the handler.
+            dm.startup().await?;
+        }
 
         let responder = Responder::new_default(&dm);
 
@@ -255,11 +317,11 @@ impl<C: Crypto> E2eRunner<C> {
         .await
     }
 
-    fn new_matter() -> Matter<'static> {
+    fn new_matter(dev_det: &'static BasicInfoConfig<'static>) -> Matter<'static> {
         #[cfg(not(feature = "std"))]
         use rs_matter::utils::rand::dummy_rand as rand;
 
-        let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, MATTER_PORT);
+        let matter = Matter::new(dev_det, TEST_DEV_COMM, &TEST_DEV_ATT, MATTER_PORT);
 
         matter.with_state(|state| {
             state.fabrics.add_with_post_init(|_| Ok(())).unwrap();
@@ -289,6 +351,7 @@ impl<C: Crypto> E2eRunner<C> {
                 fab_idx: NonZeroU8::new(1).unwrap(),
                 cat_ids: *cat_ids,
             },
+            None,
             None,
             None,
             None,

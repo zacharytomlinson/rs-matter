@@ -35,13 +35,13 @@ use core::num::NonZeroU8;
 
 use crate::crypto::Crypto;
 use crate::dm::{
-    ArrayAttributeRead, ArrayAttributeWrite, AttrChangeNotifier, Cluster, Dataver, InvokeContext,
-    ReadContext, WriteContext,
+    ArrayAttributeRead, ArrayAttributeWrite, AttrChangeNotifier, Cluster, Dataver, HandlerContext,
+    InvokeContext, LifecycleOp, ReadContext, WriteContext,
 };
 use crate::dm::{AttrId, EndptId, NodeId};
 use crate::error::{Error, ErrorCode};
 use crate::fabric::MAX_FABRICS;
-use crate::persist::{KvBlobStore, Persist, OTA_PROVIDERS_KEY};
+use crate::persist::{KvBlobStore, KvBlobStoreAccess, Persist, OTA_PROVIDERS_KEY};
 use crate::tlv::{FromTLV, Nullable, Octets, TLVArray, TLVBuilderParent, TLVElement, ToTLV};
 use crate::transport::exchange::Exchange;
 use crate::utils::cell::RefCell;
@@ -278,17 +278,15 @@ impl Providers {
     pub fn init() -> impl Init<Self> {
         init!(Self {
             state <- Mutex::init(RefCell::init(ProvidersState::init())),
-            changed: Notification::new(),
+            changed <- Notification::init(),
         })
     }
 
-    /// Re-hydrate the default provider list from `store`. Call once at startup,
-    /// before exposing the data model.
-    pub async fn load_persist<S: KvBlobStore>(
-        &self,
-        mut store: S,
-        buf: &mut [u8],
-    ) -> Result<(), Error> {
+    /// Re-hydrate the default provider list from `store`.
+    ///
+    /// Called on startup via the [`LifecycleOp::Startup`] lifecycle operation
+    /// delivered to the [`OtaRequestorHandler`] borrowing this registry.
+    pub fn load_persist<S: KvBlobStore>(&self, mut store: S, buf: &mut [u8]) -> Result<(), Error> {
         let Some(data) = store.load(OTA_PROVIDERS_KEY, buf)? else {
             self.state.lock(|cell| cell.borrow_mut().default.clear());
             return Ok(());
@@ -302,8 +300,52 @@ impl Providers {
         Ok(())
     }
 
+    /// Reset the registry - both the persisted default provider list and the
+    /// transient announced-provider cache - and remove the persisted blob from
+    /// `store` (under [`OTA_PROVIDERS_KEY`]).
+    ///
+    /// Called on factory reset via the [`LifecycleOp::FactoryReset`] lifecycle
+    /// operation delivered to the [`OtaRequestorHandler`] borrowing this registry.
+    pub fn reset_persist<S: KvBlobStore>(&self, mut store: S, buf: &mut [u8]) -> Result<(), Error> {
+        self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+
+            state.default.clear();
+            state.announced.clear();
+        });
+
+        store.remove(OTA_PROVIDERS_KEY, buf)
+    }
+
+    /// Drop the default and announced providers belonging to `fab_idx`,
+    /// returning whether anything was removed. Signals
+    /// [`wait_changed`](Self::wait_changed) when so.
+    ///
+    /// Called on fabric removal via the [`LifecycleOp::FabricRemoval`]
+    /// lifecycle operation delivered to the [`OtaRequestorHandler`] borrowing
+    /// this registry. Idempotent.
+    pub fn remove_for_fabric(&self, fab_idx: NonZeroU8) -> bool {
+        let removed = self.state.lock(|cell| {
+            let mut state = cell.borrow_mut();
+            let before = state.default.len() + state.announced.len();
+
+            state.default.retain(|provider| provider.fab_idx != fab_idx);
+            state
+                .announced
+                .retain(|provider| provider.fab_idx != fab_idx);
+
+            state.default.len() + state.announced.len() < before
+        });
+
+        if removed {
+            self.changed.notify();
+        }
+
+        removed
+    }
+
     /// Persist the default provider list to `ctx.kv()`.
-    fn store_persist<C: WriteContext>(&self, ctx: &C) -> Result<(), Error> {
+    fn store_persist<C: HandlerContext>(&self, ctx: &C) -> Result<(), Error> {
         let mut persist = Persist::new(ctx.kv());
 
         self.state.lock(|cell| {
@@ -667,6 +709,24 @@ impl ClusterHandler for OtaRequestorHandler<'_> {
 
     fn dataver_changed(&self) {
         self.dataver.changed();
+    }
+
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        match op {
+            LifecycleOp::Startup => ctx
+                .kv()
+                .access(|store, buf| self.providers.load_persist(store, buf)),
+            LifecycleOp::FactoryReset => ctx
+                .kv()
+                .access(|store, buf| self.providers.reset_persist(store, buf)),
+            LifecycleOp::FabricRemoval { fab_idx } => {
+                if self.providers.remove_for_fabric(fab_idx) {
+                    self.providers.store_persist(&ctx)?;
+                }
+
+                Ok(())
+            }
+        }
     }
 
     fn default_ota_providers<P: TLVBuilderParent>(

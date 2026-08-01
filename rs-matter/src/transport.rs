@@ -23,7 +23,9 @@ use core::pin::pin;
 
 use domain::base::name::ToLabelIter;
 
-use embassy_futures::select::{select, select3, select4, Either};
+#[cfg(feature = "groups")]
+use embassy_futures::select::select4;
+use embassy_futures::select::{select, select3, Either};
 use embassy_time::{Duration, Timer};
 
 use rand_core::RngCore;
@@ -32,24 +34,31 @@ use crate::crypto::Crypto;
 use crate::dm::clusters::basic_info::BasicInfoConfig;
 use crate::dm::NodeId;
 use crate::error::{Error, ErrorCode};
+#[cfg(feature = "groups")]
 use crate::fabric::{MAX_FABRICS, MAX_GROUPS_PER_FABRIC};
 use crate::fmt::Bytes;
+use crate::im::PROTO_ID_INTERACTION_MODEL;
+#[cfg(not(feature = "case-responder-only"))]
 use crate::sc::case::CaseInitiator;
 use crate::sc::pase::PaseInitiator;
-use crate::sc::{
-    sc_write, OpCode, SCStatusCodes, SessionParameters, StatusReport, PROTO_ID_SECURE_CHANNEL,
-};
+#[cfg(not(feature = "case-responder-only"))]
+use crate::sc::SessionParameters;
+use crate::sc::{sc_write, OpCode, SCStatusCodes, StatusReport, PROTO_ID_SECURE_CHANNEL};
 use crate::tlv::TLVElement;
 use crate::transport::network::mdns::{
     commissionable_instance_id, score_ip_address, BrowseExclude, CommissionableFilter,
     MdnsBrowseState, MdnsRemoteService, MdnsResolveState, ResolvedNode,
 };
 use crate::transport::network::{MatterRemoteService, NetworkMulticast};
+use crate::utils::cell::RefCell;
 use crate::utils::init::{init, Init};
+#[cfg(feature = "groups")]
 use crate::utils::ipv6::compute_group_multicast_addr;
 use crate::utils::select::Coalesce;
 use crate::utils::storage::Vec;
 use crate::utils::storage::{pooled::Buffers, ParseBuf, WriteBuf};
+
+use crate::utils::sync::blocking::Mutex;
 use crate::utils::sync::{IfMutex, IfMutexGuard, Notification, Signal};
 use crate::{Matter, MATTER_PORT};
 
@@ -58,6 +67,8 @@ use network::{Address, IpAddr, Ipv6Addr, NetworkReceive, NetworkSend, SocketAddr
 use packet::PacketHdr;
 use proto_hdr::ProtoHdr;
 use session::{Session, Sessions};
+
+use self::mrp::mrp_log;
 
 mod dedup;
 
@@ -72,7 +83,14 @@ pub mod session;
 pub const MATTER_SOCKET_BIND_ADDR: SocketAddr =
     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MATTER_PORT, 0, 0));
 
-const MAX_GROUP_ADDRS: usize = MAX_FABRICS * MAX_GROUPS_PER_FABRIC;
+#[cfg(feature = "groups")]
+const MAX_GROUP_ADDRS: usize = MAX_FABRICS * MAX_GROUPS_PER_FABRIC + 1; // +1 for the IANA-assigned Groupcast address
+/// Without multicast group support no group addresses are ever joined, so the
+/// join-list is zero-capacity. Keeping the field (rather than gating it) avoids
+/// splitting the in-place `Transport` initializer, and a `Vec<_, 0>` costs no
+/// RAM.
+#[cfg(not(feature = "groups"))]
+const MAX_GROUP_ADDRS: usize = 0;
 
 const ACCEPT_TIMEOUT_MS: u64 = 1000;
 
@@ -105,6 +123,7 @@ pub struct Transport {
     // TODO XXX FIXME: Needs multiple wakers for work-stealing executors
     tx: IfMutex<Packet<MAX_TX_BUF_SIZE>>,
     /// List of currently joined group addresses, used for managing multicast group membership.
+    /// Zero-capacity (and thus never populated) without the `groups` feature.
     group_addrs: IfMutex<Vec<Ipv6Addr, MAX_GROUP_ADDRS>>,
     /// Notification for when an exchange is dropped.
     exchange_dropped: Notification,
@@ -118,8 +137,22 @@ pub struct Transport {
     mdns_browse: Signal<MdnsBrowseState>,
     /// A notification that a session had been removed
     session_removed: Notification,
-    /// A notification that the groups have been modified
+    /// A notification that the groups have been modified.
+    /// Unused without the `groups` feature, but kept unconditionally so the
+    /// in-place `Transport` initializer needs no feature-specific variant.
+    #[cfg_attr(not(feature = "groups"), allow(dead_code))]
     groups_modified: Notification,
+    /// A notification that the CASE session resumption cache has been
+    /// mutated and should be re-persisted by the background persist
+    /// task (see [`crate::Matter::run_persist_resumption`]).
+    ///
+    /// Kept as a field unconditionally (a zero-cost `Notification`) so the
+    /// `new`/`init` constructors need no `case-resumption`-specific variant;
+    /// only the notify/wait accessors are gated.
+    #[cfg_attr(not(feature = "case-resumption"), allow(dead_code))]
+    resumption_dirty: Notification,
+    /// Counters for the messages crossing this node.
+    counters: Mutex<RefCell<MessageCounters>>,
     /// Device SAI (Secure Association Identifier)
     device_sai: Option<u32>,
     /// Device SII (Secure Identity Identifier)
@@ -140,6 +173,8 @@ impl Transport {
             mdns_browse: Signal::new(MdnsBrowseState::Idle),
             session_removed: Notification::new(),
             groups_modified: Notification::new(),
+            resumption_dirty: Notification::new(),
+            counters: Mutex::new(RefCell::new(MessageCounters::new())),
             device_sai: dev_det.sai,
             device_sii: dev_det.sii,
         }
@@ -150,13 +185,15 @@ impl Transport {
         init!(Self {
             rx <- IfMutex::init(Packet::init()),
             tx <- IfMutex::init(Packet::init()),
-            group_addrs <- IfMutex::init(Vec::new()),
-            exchange_dropped: Notification::new(),
-            mdns_changed: Notification::new(),
-            mdns_resolve: Signal::new(MdnsResolveState::Idle),
-            mdns_browse: Signal::new(MdnsBrowseState::Idle),
-            session_removed: Notification::new(),
-            groups_modified: Notification::new(),
+            group_addrs <- IfMutex::init(Vec::init()),
+            exchange_dropped <- Notification::init(),
+            mdns_changed <- Notification::init(),
+            mdns_resolve <- Signal::init(MdnsResolveState::Idle),
+            mdns_browse <- Signal::init(MdnsBrowseState::Idle),
+            session_removed <- Notification::init(),
+            groups_modified <- Notification::init(),
+            resumption_dirty <- Notification::init(),
+            counters <- Mutex::init(RefCell::init(MessageCounters::new())),
             device_sai: dev_det.sai,
             device_sii: dev_det.sii,
         })
@@ -210,13 +247,20 @@ impl Transport {
 
     /// Notify that groups have changed (keys, key maps, or membership) and
     /// multicast registrations need updating.
+    #[cfg(feature = "groups")]
     pub(crate) fn notify_groups_changed(&self) {
         self.groups_modified.notify();
     }
 
     /// Wait until the groups have changed (see [`Transport::notify_groups_changed`]).
+    #[cfg(feature = "groups")]
     fn wait_groups_changed(&self) -> impl Future<Output = ()> + '_ {
         self.groups_modified.wait()
+    }
+
+    /// The message counters of this node.
+    pub fn counters(&self) -> MessageCounters {
+        self.counters.lock(|counters| counters.borrow().clone())
     }
 
     /// Notify that a session has been removed.
@@ -227,6 +271,23 @@ impl Transport {
     /// Wait until a session has been removed (see [`Transport::notify_session_removed`]).
     pub(crate) fn wait_session_removed(&self) -> impl Future<Output = ()> + '_ {
         self.session_removed.wait()
+    }
+
+    /// Notify that the CASE session resumption cache was mutated and
+    /// should be re-persisted. Fired from every code path that inserts,
+    /// rotates or evicts a [`crate::sc::case::ResumableSession`].
+    #[cfg(feature = "case-resumption")]
+    pub(crate) fn notify_resumption_dirty(&self) {
+        self.resumption_dirty.notify();
+    }
+
+    /// Wait until the CASE session resumption cache has been mutated
+    /// (see [`Transport::notify_resumption_dirty`]). Used by the
+    /// [`crate::Matter::run_persist_resumption`] background task to
+    /// know when to flush the cache to storage.
+    #[cfg(feature = "case-resumption")]
+    pub(crate) fn wait_resumption_dirty(&self) -> impl Future<Output = ()> + '_ {
+        self.resumption_dirty.wait()
     }
 
     /// Resolve a Matter service instance's address over mDNS.
@@ -668,9 +729,29 @@ impl Transport {
         })?;
 
         if let Some(session_id) = existing {
-            return self.initiate_for_session(matter, session_id);
+            return self.initiate_for_session(matter, crypto, session_id);
         }
 
+        self.initiate_new_case(matter, crypto, fabric_idx, peer_node_id)
+            .await
+    }
+
+    /// Establish a fresh CASE session to an already-commissioned peer (resolving
+    /// its operational address over mDNS), then open an exchange on it. Called by
+    /// [`initiate`](Self::initiate) only when no live session to the peer exists.
+    ///
+    /// With the `case-responder-only` feature this is compiled out and replaced
+    /// by an immediate [`ErrorCode::NoSession`]: reporting (and every other
+    /// on-demand initiator) then reuses an existing session or fails, and the
+    /// linker drops the whole CASE-initiator and mDNS-resolver machinery.
+    #[cfg(not(feature = "case-responder-only"))]
+    async fn initiate_new_case<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+    ) -> Result<Exchange<'a>, Error> {
         // No CASE session: resolve the operational address and establish one.
         let compressed_fabric_id = matter.with_state(|state| {
             Ok::<_, Error>(state.fabrics.fabric(fabric_idx)?.compressed_fabric_id())
@@ -686,13 +767,11 @@ impl Transport {
         // Establish CASE over a fresh, one-shot unsecured exchange to the
         // resolved address. On success a secure session keyed at
         // `(fabric_idx, peer_node_id)` is recorded in the stack.
-        {
-            let mut exchange = self
-                .initiate_plaintext(matter, &crypto, Address::Udp(resolved.addr))
-                .await?;
+        let exchange = self
+            .initiate_plaintext(matter, &crypto, Address::Udp(resolved.addr))
+            .await?;
 
-            CaseInitiator::initiate(&mut exchange, &crypto, fabric_idx, peer_node_id).await?;
-        }
+        CaseInitiator::perform(exchange, &crypto, fabric_idx, peer_node_id).await?;
 
         // Seed the new CASE session's peer MRP/session params from the resolve
         // TXT (rs-matter does not yet exchange these in CASE Sigma1/2) and grab
@@ -715,7 +794,55 @@ impl Transport {
             Ok::<_, Error>(session.id)
         })?;
 
-        self.initiate_for_session(matter, session_id)
+        self.initiate_for_session(matter, crypto, session_id)
+    }
+
+    /// The `case-responder-only` variant: never establish a new CASE session.
+    ///
+    /// See the other [`initiate_new_case`](Self::initiate_new_case) for why this
+    /// exists. Reporting (and any other on-demand initiator) reuses an existing
+    /// session or gets [`ErrorCode::NoSession`]; nothing here references the CASE
+    /// initiator or the mDNS resolver, so the linker can drop them.
+    #[cfg(feature = "case-responder-only")]
+    async fn initiate_new_case<'a, C: Crypto>(
+        &self,
+        _matter: &'a Matter<'a>,
+        _crypto: C,
+        _fabric_idx: NonZeroU8,
+        _peer_node_id: NodeId,
+    ) -> Result<Exchange<'a>, Error> {
+        Err(ErrorCode::NoSession.into())
+    }
+
+    /// Open an exchange over a fresh **unsecured** session to an already-
+    /// commissioned node, resolving its operational address over mDNS.
+    ///
+    /// Unlike [`initiate`](Self::initiate) this establishes no secure session; it
+    /// is for sessionless protocols that carry their own security (e.g. the
+    /// Check-In message), and it never reuses or creates a CASE session.
+    ///
+    /// Requires a running mDNS responder to service the resolve; without one the
+    /// resolve times out and this returns [`ErrorCode::NotFound`].
+    pub(crate) async fn initiate_plaintext_operational<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+    ) -> Result<Exchange<'a>, Error> {
+        let compressed_fabric_id = matter.with_state(|state| {
+            Ok::<_, Error>(state.fabrics.fabric(fabric_idx)?.compressed_fabric_id())
+        })?;
+
+        let service = MatterRemoteService::Operational {
+            compressed_fabric_id,
+            node_id: peer_node_id,
+        };
+
+        let resolved = self.resolve(service, Self::RESOLVE_TIMEOUT_MS).await?;
+
+        self.initiate_plaintext(matter, crypto, Address::Udp(resolved.addr))
+            .await
     }
 
     /// Open an exchange over a PASE session to a not-yet-commissioned node at the
@@ -745,16 +872,12 @@ impl Transport {
         })?;
 
         if let Some(session_id) = existing {
-            return self.initiate_for_session(matter, session_id);
+            return self.initiate_for_session(matter, crypto, session_id);
         }
 
         // Establish a new PASE session to this peer.
-        {
-            let mut handshake = self.initiate_plaintext(matter, &crypto, peer_addr).await?;
-            PaseInitiator::initiate(&mut handshake, &crypto, passcode).await?;
-            // The PASE-establishment exchange is one-shot; drop it here so the
-            // caller opens fresh exchanges on the new PASE session.
-        }
+        let exchange = self.initiate_plaintext(matter, &crypto, peer_addr).await?;
+        PaseInitiator::perform(exchange, &crypto, passcode).await?;
 
         let session_id = matter.with_state(|state| {
             state
@@ -764,12 +887,13 @@ impl Transport {
                 .ok_or_else(|| Error::from(ErrorCode::NoSession))
         })?;
 
-        self.initiate_for_session(matter, session_id)
+        self.initiate_for_session(matter, crypto, session_id)
     }
 
-    pub(crate) fn initiate_for_session<'a>(
+    pub(crate) fn initiate_for_session<'a, C: Crypto>(
         &self,
         matter: &'a Matter<'a>,
+        crypto: C,
         session_id: u32,
     ) -> Result<Exchange<'a>, Error> {
         matter.with_state(|state| {
@@ -780,7 +904,7 @@ impl Transport {
                 .filter(|sess| !sess.is_expired())
                 .ok_or(ErrorCode::NoSession)?;
 
-            let exch_id = state.sessions.get_next_exch_id();
+            let exch_id = state.sessions.get_next_exch_id(crypto)?;
 
             // `unwrap` is safe because we know we have a session or else the early return from above would've triggered
             // The reason why we call `get_for_node` twice is to ensure that we don't waste an `exch_id` in case
@@ -837,9 +961,9 @@ impl Transport {
         crypto: C,
         peer_addr: Address,
     ) -> Result<Exchange<'a>, Error> {
-        let session_id = self.create_plaintext_session(matter, crypto, peer_addr)?;
+        let session_id = self.create_plaintext_session(matter, &crypto, peer_addr)?;
 
-        self.initiate_for_session(matter, session_id)
+        self.initiate_for_session(matter, crypto, session_id)
     }
 
     /// Create a new unsecured (plain-text) session to a given peer address.
@@ -989,7 +1113,15 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
     }
 
     /// Run the transport runner with the given network send, receive and multicast implementations.
-    pub async fn run<S, R, M>(&mut self, send: S, recv: R, multicast: M) -> Result<(), Error>
+    ///
+    /// The `multicast` implementation is only used to manage group (multicast)
+    /// membership, so without the `groups` feature it is accepted but never used.
+    pub async fn run<S, R, M>(
+        &mut self,
+        send: S,
+        recv: R,
+        #[cfg_attr(not(feature = "groups"), allow(unused_variables))] multicast: M,
+    ) -> Result<(), Error>
     where
         S: NetworkSend,
         R: NetworkReceive,
@@ -1001,20 +1133,87 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         // C++ E2E tests rely on this log line to determine when the tested app is ready
         debug!("APP STATUS: Starting event loop");
 
-        let mut joined = self.transport().group_addrs.lock().await;
-
         let send = IfMutex::new(send);
 
         let mut rx = pin!(self.process_rx(recv, &send));
         let mut tx = pin!(self.process_tx(&send));
         let mut orphaned = pin!(self.process_orphaned());
-        let mut groups = pin!(self.process_groups(multicast, &mut joined));
 
-        select4(&mut rx, &mut tx, &mut orphaned, &mut groups)
-            .coalesce()
-            .await
+        #[cfg(feature = "groups")]
+        {
+            let mut joined = self.transport().group_addrs.lock().await;
+            let mut groups = pin!(self.process_groups(multicast, &mut joined));
+
+            select4(&mut rx, &mut tx, &mut orphaned, &mut groups)
+                .coalesce()
+                .await
+        }
+
+        #[cfg(not(feature = "groups"))]
+        {
+            select3(&mut rx, &mut tx, &mut orphaned).coalesce().await
+        }
     }
 
+    /// Record a `GroupcastTesting` observation for a multicast group data
+    /// message that failed decode/decryption, when the Groupcast listener
+    /// testing mode is armed. See the Matter Core spec's `GroupcastTesting`
+    /// command for the result classification.
+    #[cfg(feature = "groups")]
+    fn observe_group_rx_failure<const N: usize>(
+        &self,
+        packet: &Packet<N>,
+        fabrics: &crate::fabric::Fabrics,
+        e: &Error,
+    ) {
+        use crate::dm::clusters::groupcast;
+
+        // Only multicast group *data* messages participate (not unicast
+        // group-encrypted MCSP control messages)
+        let Some(group_id) = packet.header.plain.get_dst_groupcast_nodeid() else {
+            return;
+        };
+
+        let Some(mode) = self
+            .matter
+            .groupcast_testing()
+            .armed(groupcast::GroupcastTestingEnum::EnableListenerTesting)
+        else {
+            return;
+        };
+
+        let (result, authenticated) = match e.code() {
+            // No candidate key was available to even attempt decryption
+            ErrorCode::NoSession => (groupcast::GroupcastTestResultEnum::NoAvailableKey, false),
+            // Candidate key(s) were tried, none authenticated the message
+            ErrorCode::InvalidSignature => (groupcast::GroupcastTestResultEnum::FailedAuth, false),
+            // Authenticated, but a duplicate of an already-received message
+            ErrorCode::Duplicate => (groupcast::GroupcastTestResultEnum::MessageReplay, true),
+            _ => (groupcast::GroupcastTestResultEnum::GeneralError, false),
+        };
+
+        self.matter
+            .groupcast_testing()
+            .observe(groupcast::TestingObservation {
+                src_ip: groupcast::TestingObservation::addr_ip(&packet.peer),
+                dst_ip: Some(groupcast::TestingObservation::group_dst_ip(
+                    fabrics,
+                    mode.fab_idx,
+                    group_id,
+                )),
+                // Per the Matter Core spec, the `GroupID` field is filled
+                // from the request only when the message was properly
+                // authenticated for the fabric under test
+                group_id: authenticated.then_some(group_id),
+                endpoint_id: None,
+                cluster_id: None,
+                element_id: None,
+                access_allowed: None,
+                result,
+            });
+    }
+
+    #[cfg(feature = "groups")]
     async fn process_groups<M>(
         &self,
         mut multicast: M,
@@ -1030,7 +1229,23 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 let group_addrs = || {
                     state.fabrics.iter().flat_map(|fabric| {
                         fabric.groups().iter().map(|group| {
-                            compute_group_multicast_addr(fabric.fabric_id(), group.group_id)
+                            // Groups with the `IanaAddr` Groupcast policy all
+                            // share the IANA-assigned address; `PerGroup` ones
+                            // (and legacy Groups-cluster entries, which behave
+                            // as `PerGroup`) each use a fabric+group-scoped
+                            // address. Duplicate enumeration of the shared
+                            // address is fine - the join/leave reconciliation
+                            // below is idempotent per address.
+                            use crate::dm::clusters::decl::groupcast::MulticastAddrPolicyEnum;
+
+                            match group.effective_mcast_policy() {
+                                MulticastAddrPolicyEnum::IanaAddr => {
+                                    crate::utils::ipv6::IANA_GROUPCAST_MULTICAST_ADDR
+                                }
+                                MulticastAddrPolicyEnum::PerGroup => {
+                                    compute_group_multicast_addr(fabric.fabric_id(), group.group_id)
+                                }
+                            }
                         })
                     })
                 };
@@ -1117,6 +1332,12 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             }
 
             Self::netw_send(send, tx.peer, &tx.buf[tx.payload_start..], false).await?;
+
+            if !tx.tx_info.retransmission {
+                self.transport()
+                    .counters
+                    .lock(|counters| counters.borrow_mut().record_sent(&tx.header.proto));
+            }
         }
     }
 
@@ -1246,14 +1467,14 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             Err(e) if matches!(e.code(), ErrorCode::Duplicate) => {
                 if packet.header.plain.is_group_session() {
                     // Group messages are multicast and don't use MRP; silently discard duplicates
-                    debug!(
+                    mrp_log!(
                         "\n>>RCV {}\n      => Duplicate group message, discarding",
                         packet
                     );
                 } else if !packet.peer.is_reliable()
                     && !MessageMeta::from(&packet.header.proto).is_standalone_ack()
                 {
-                    debug!("\n>>RCV {}\n      => Duplicate, sending ACK", packet);
+                    mrp_log!("\n>>RCV {}\n      => Duplicate, sending ACK", packet);
 
                     self.matter.with_state(|state| {
                         // `unwrap` is safe because we know we have a session.
@@ -1278,7 +1499,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
                         .await?;
                 } else {
-                    debug!("\n>>RCV {}\n      => Duplicate, discarding", packet);
+                    mrp_log!("\n>>RCV {}\n      => Duplicate, discarding", packet);
                 }
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSpaceSessions) => {
@@ -1341,7 +1562,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                         .get_for_rx(&packet.peer, &packet.header.plain))
                     .id;
 
-                    packet.header.proto.exch_id = state.sessions.get_next_exch_id();
+                    packet.header.proto.exch_id = state.sessions.get_next_exch_id(&self.crypto)?;
                     packet.header.proto.set_initiator();
 
                     // See above why `unwrap` is safe
@@ -1357,7 +1578,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     .await?;
             }
             Err(e) if matches!(e.code(), ErrorCode::NoExchange) => {
-                warn!(
+                mrp_log!(
                     "\n>>RCV {}\n      => No valid exchange found, dropping",
                     packet
                 );
@@ -1426,13 +1647,17 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                         }
                     });
                 } else {
+                    self.transport()
+                        .counters
+                        .lock(|counters| counters.borrow_mut().record_recv(&packet.header.proto));
+
                     debug!(
                         "\n>>RCV {}\n      => Processing{}",
                         packet,
                         if new_exchange { " (new exchange)" } else { "" }
                     );
 
-                    #[cfg(feature = "debug-tlv-payload")]
+                    #[cfg(feature = "log-tlv-payload")]
                     debug!(
                         "{}",
                         Packet::<0>::display_payload(
@@ -1441,7 +1666,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                         )
                     );
 
-                    #[cfg(not(feature = "debug-tlv-payload"))]
+                    #[cfg(not(feature = "log-tlv-payload"))]
                     trace!(
                         "{}",
                         Packet::<0>::display_payload(
@@ -1486,7 +1711,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 return false;
             }
 
-            warn!(
+            mrp_log!(
                 "\n>>RCV {}\n => Accept timeout, marking exchange as dropped",
                 packet
             );
@@ -1509,14 +1734,14 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 .sessions
                 .get_for_rx(&packet.peer, &packet.header.plain)
             else {
-                warn!("\n>>RCV {}\n => No session, dropping", packet);
+                mrp_log!("\n>>RCV {}\n => No session, dropping", packet);
 
                 packet.buf.clear();
                 return true;
             };
 
             let Some(exch_index) = session.get_exch_for_rx(&packet.header.proto) else {
-                warn!("\n>>RCV {}\n => No exchange, dropping", packet);
+                mrp_log!("\n>>RCV {}\n => No exchange, dropping", packet);
 
                 packet.buf.clear();
                 return true;
@@ -1526,7 +1751,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             let exchange = unwrap!(session.exchanges[exch_index].as_mut());
 
             if exchange.role.is_dropped_state() {
-                warn!(
+                mrp_log!(
                     "\n>>RCV {}\n => Owned by orphaned dropped {}, dropping packet",
                     packet,
                     ExchangeId::new(session.id, exch_index)
@@ -1676,18 +1901,35 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     // Session created successfully: decode, indicate packet payload slice and process further
                     return session.post_recv(&packet.header);
                 }
-            } else if packet.header.plain.is_group_session() {
-                // Group (multicast) message — derive keys on-the-fly and decrypt
-                let (session, payload_range) = state.sessions.get_or_create_for_group_rx(
-                    &self.crypto,
-                    &state.fabrics,
-                    packet,
-                    self.matter.dev_det(),
-                )?;
-                set_payload(packet, payload_range);
-
-                return session.post_recv(&packet.header);
             } else {
+                #[cfg(feature = "groups")]
+                if packet.header.plain.is_group_session() {
+                    // Group (multicast) message — derive keys on-the-fly and decrypt
+                    let result = state.sessions.get_or_create_for_group_rx(
+                        &self.crypto,
+                        &state.fabrics,
+                        packet,
+                        self.matter.dev_det(),
+                    );
+
+                    let (session, payload_range) = match result {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            // When the Groupcast listener testing mode is
+                            // armed, report failed multicast group messages
+                            // as `GroupcastTesting` observations (turned
+                            // into events by the Groupcast handler)
+                            self.observe_group_rx_failure(packet, &state.fabrics, &e);
+
+                            return Err(e);
+                        }
+                    };
+
+                    set_payload(packet, payload_range);
+
+                    return session.post_recv(&packet.header);
+                }
+
                 // Encrypted unicast packet with no matching session — cannot be decoded
                 set_payload(packet, (0, 0));
             }
@@ -1708,17 +1950,19 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
 
         let payload_end = packet.buf.len();
 
-        debug!(
-            "\n<<SND {}\n      => {}",
-            Packet::<0>::display(&packet.peer, &packet.header),
-            if packet.tx_info.retransmission {
-                "Re-sending"
-            } else {
-                "Sending"
-            }
-        );
+        if packet.tx_info.retransmission {
+            mrp_log!(
+                "\n<<SND {}\n      => Re-sending",
+                Packet::<0>::display(&packet.peer, &packet.header),
+            );
+        } else {
+            debug!(
+                "\n<<SND {}\n      => Sending",
+                Packet::<0>::display(&packet.peer, &packet.header),
+            );
+        }
 
-        #[cfg(feature = "debug-tlv-payload")]
+        #[cfg(feature = "log-tlv-payload")]
         debug!(
             "{}",
             Packet::<0>::display_payload(
@@ -1727,7 +1971,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             )
         );
 
-        #[cfg(not(feature = "debug-tlv-payload"))]
+        #[cfg(not(feature = "log-tlv-payload"))]
         trace!(
             "{}",
             Packet::<0>::display_payload(
@@ -1792,9 +2036,14 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         if let Some(session) = &mut session {
             packet.header.plain = Default::default();
 
+            // Group DATA messages are only ever sent through the exchange
+            // path (`ExchangeSender`), which supplies the global group data
+            // counter; this transport-level path serves the remaining
+            // (unicast and group-control) sends.
             let (peer, retransmission) = session.pre_send(
                 exchange_index,
                 &mut packet.header,
+                None,
                 self.transport().device_sai,
                 self.transport().device_sii,
             )?;
@@ -1865,7 +2114,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         id: u32,
         encode: bool,
     ) -> Result<(), Error> {
-        packet.header.proto.exch_id = sessions.get_next_exch_id();
+        packet.header.proto.exch_id = sessions.get_next_exch_id(&self.crypto)?;
         packet.header.proto.set_initiator();
 
         // It is a responsibility of the caller to ensure that this method is called with a valid session ID
@@ -2311,6 +2560,37 @@ impl<const N: usize> Drop for ExternalPacketBuffer<'_, N> {
     }
 }
 
+/// The number of messages sent and received by the transport layer.
+#[derive(Default, Clone, Eq, PartialEq, Debug, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct MessageCounters {
+    /// The number of IM messages sent by the transport layer.
+    pub im_sent: u32,
+    /// The number of IM messages received by the transport layer.
+    pub im_received: u32,
+}
+
+impl MessageCounters {
+    const fn new() -> Self {
+        Self {
+            im_sent: 0,
+            im_received: 0,
+        }
+    }
+
+    fn record_sent(&mut self, hdr: &ProtoHdr) {
+        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+            self.im_sent = self.im_sent.saturating_add(1);
+        }
+    }
+
+    fn record_recv(&mut self, hdr: &ProtoHdr) {
+        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+            self.im_received = self.im_received.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2322,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_unsecured_session_creates_plaintext_session() {
+    fn test_create_plaintext_session() {
         let matter = test_matter();
         let crypto = test_only_crypto();
         let peer = Address::new();
@@ -2343,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_initiate_unsecured_now_creates_initiator_exchange() {
+    fn test_initiate_plaintext_now_creates_initiator_exchange() {
         let matter = test_matter();
         let crypto = test_only_crypto();
         let peer = Address::new();

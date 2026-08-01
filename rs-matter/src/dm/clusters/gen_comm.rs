@@ -21,13 +21,16 @@ use core::fmt::Debug;
 
 use either::Either;
 
+use rand_core::RngCore;
+
+use crate::crypto::Crypto;
 use crate::dm::clusters::net_comm::NetworksAccess;
 use crate::dm::{Cluster, Dataver, InvokeContext, OperationContext, ReadContext, WriteContext};
 use crate::error::{Error, ErrorCode};
 use crate::fabric::FabricPersist;
-use crate::persist::{Persist, BASIC_INFO_KEY, NETWORKS_KEY};
+use crate::persist::{Persist, NETWORKS_KEY};
 use crate::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
-use crate::tlv::TLVBuilderParent;
+use crate::tlv::{Nullable, Octets, OctetsBuilder, TLVBuilderParent};
 use crate::transport::session::SessionMode;
 use crate::utils::sync::DynBase;
 use crate::{except, with, MatterState};
@@ -76,9 +79,6 @@ pub trait CommPolicy: DynBase {
     /// Return the maximum cumulative fail-safe time in seconds.
     fn failsafe_max_cml_secs(&self) -> u16;
 
-    /// Return the regulatory configuration of the device.
-    fn regulatory_config(&self) -> RegulatoryLocationTypeEnum;
-
     /// Return the location capability of the device.
     fn location_cap(&self) -> RegulatoryLocationTypeEnum;
 }
@@ -97,10 +97,6 @@ where
 
     fn failsafe_max_cml_secs(&self) -> u16 {
         (*self).failsafe_max_cml_secs()
-    }
-
-    fn regulatory_config(&self) -> RegulatoryLocationTypeEnum {
-        (*self).regulatory_config()
     }
 
     fn location_cap(&self) -> RegulatoryLocationTypeEnum {
@@ -127,10 +123,6 @@ impl CommPolicy for bool {
         // bounds at [180, 900] seconds; reporting 900 keeps such tests within
         // the valid range while still being a reasonable upper bound.
         MAX_COMM_WINDOW_TIMEOUT_SECS
-    }
-
-    fn regulatory_config(&self) -> RegulatoryLocationTypeEnum {
-        RegulatoryLocationTypeEnum::IndoorOutdoor
     }
 
     fn location_cap(&self) -> RegulatoryLocationTypeEnum {
@@ -214,7 +206,60 @@ impl<'a> GenCommHandler<'a> {
             f(state, &mut notify_mdns)
         })
     }
+
+    /// Return the node's `RecoveryIdentifier`, minting and persisting a stable
+    /// random 64-bit value on first access.
+    fn recovery_identifier_value(ctx: &impl ReadContext) -> Result<u64, Error> {
+        // Fast path: the value has already been minted (this read, a prior
+        // read, or a reload from persistence).
+        if let Some(id) = ctx
+            .exchange()
+            .with_state(|state| Ok(state.basic_info_settings.recovery_identifier))?
+        {
+            return Ok(id);
+        }
+
+        // Mint a fresh 64-bit value from the CSPRNG.
+        let fresh = ctx.crypto().rand()?.next_u64();
+
+        let mut persist = Persist::new(ctx.kv());
+
+        let id = ctx.exchange().with_state(|state| {
+            // Re-check under the state borrow: a concurrent read may have
+            // minted the value first, in which case we keep the stored one.
+            let id = *state
+                .basic_info_settings
+                .recovery_identifier
+                .get_or_insert(fresh);
+
+            state.basic_info_settings.store_persist(&mut persist)?;
+
+            Ok(id)
+        })?;
+
+        persist.run()?;
+
+        Ok(id)
+    }
 }
+
+/// Opt-in General Commissioning metadata that additionally advertises the
+/// **Network Recovery** feature (Matter 1.6, provisional): the `NR` FeatureMap
+/// bit plus the `RecoveryIdentifier` and `NetworkRecoveryReason` attributes.
+///
+/// This mirrors [`GenCommHandler::CLUSTER`] but exposes those two provisional
+/// attributes and sets the feature bit. The runtime [`GenCommHandler`] always
+/// implements both reads, so - exactly like
+/// [`basic_info::CLUSTER_DEVICE_LOCATION`](crate::dm::clusters::basic_info::CLUSTER_DEVICE_LOCATION) -
+/// an application opts in purely by substituting this metadata for
+/// [`GenCommHandler::CLUSTER`] in its endpoint's cluster list; nothing else in
+/// the wiring changes.
+pub const CLUSTER_NETWORK_RECOVERY: Cluster<'static> = FULL_CLUSTER
+    .with_attrs(
+        with!(required; AttributeId::RecoveryIdentifier | AttributeId::NetworkRecoveryReason),
+    )
+    .with_cmds(except!(CommandId::SetTCAcknowledgements))
+    .with_features(Feature::NETWORK_RECOVERY.bits());
 
 impl ClusterHandler for GenCommHandler<'_> {
     const CLUSTER: Cluster<'static> = FULL_CLUSTER
@@ -257,8 +302,15 @@ impl ClusterHandler for GenCommHandler<'_> {
         &self,
         ctx: impl ReadContext,
     ) -> Result<RegulatoryLocationTypeEnum, Error> {
-        ctx.exchange()
-            .with_state(|state| Ok(state.basic_info_settings.location_type))
+        // Until `SetRegulatoryConfig` stores an explicit value, report
+        // `LocationCapability` - per the Matter Core spec that is the
+        // default of `RegulatoryConfig`.
+        ctx.exchange().with_state(|state| {
+            Ok(state
+                .basic_info_settings
+                .location_type
+                .unwrap_or(self.commissioning_policy.location_cap()))
+        })
     }
 
     fn location_capability(
@@ -270,6 +322,30 @@ impl ClusterHandler for GenCommHandler<'_> {
 
     fn supports_concurrent_connection(&self, _ctx: impl ReadContext) -> Result<bool, Error> {
         Ok(self.commissioning_policy.concurrent_connection_supported())
+    }
+
+    fn recovery_identifier<P: TLVBuilderParent>(
+        &self,
+        ctx: impl ReadContext,
+        builder: OctetsBuilder<P>,
+    ) -> Result<P, Error> {
+        // The 8-byte, big-endian encoding of the stable random identifier.
+        // The same byte sequence is what a Recovery Node would carry in its
+        // BLE Network-Recovery advertisement (see `RecoveryAdvData`).
+        let id = Self::recovery_identifier_value(&ctx)?;
+
+        builder.set(Octets::new(&id.to_be_bytes()))
+    }
+
+    fn network_recovery_reason(
+        &self,
+        _ctx: impl ReadContext,
+    ) -> Result<Nullable<NetworkRecoveryReasonEnum>, Error> {
+        // Matter Core Spec 11.10.6.12: this attribute is null whenever the
+        // node is not undergoing a Network Recovery flow. rs-matter core never
+        // autonomously enters recovery mode (the flow is a platform-layer
+        // concern), so the reason is always null.
+        Ok(Nullable::none())
     }
 
     fn handle_arm_fail_safe<P: TLVBuilderParent>(
@@ -292,6 +368,8 @@ impl ClusterHandler for GenCommHandler<'_> {
         // in-flight `AddNOC` / `SetRegulatoryConfig` changes are reverted —
         // the bare `failsafe.arm(0, ...)` path only flips the state to
         // `Idle` and would leave the staged fabric committed.
+        let mut removed_fabric = None;
+
         let status = if expiry_length_seconds == 0 {
             let notify_mdns = || ctx.exchange().matter().transport().notify_mdns_changed();
             let notify_change = |endpt_id, clust_id| ctx.notify_cluster_changed(endpt_id, clust_id);
@@ -301,7 +379,7 @@ impl ClusterHandler for GenCommHandler<'_> {
                 let pase_sess_id =
                     matches!(sess.get_session_mode(), SessionMode::Pase { .. }).then(|| sess.id());
 
-                state.failsafe.expire(
+                removed_fabric = state.failsafe.expire(
                     &mut state.fabrics,
                     &mut state.sessions,
                     pase_sess_id,
@@ -325,6 +403,14 @@ impl ClusterHandler for GenCommHandler<'_> {
                 )
             }))?
         };
+
+        // Broadcast for a fabric the expiry dropped (a not-yet-committed
+        // `AddNOC` one; an `UpdateNOC`-mutated fabric is resurrected instead
+        // and not reported). Outside `with_state`, since the broadcast runs
+        // the handlers inline.
+        if let Some(fab_idx) = removed_fabric {
+            ctx.notify_fabric_removed(fab_idx);
+        }
 
         // Breadcrumb (and possibly failsafe-arm state) may have changed
         ctx.notify_own_cluster_changed();
@@ -375,11 +461,11 @@ impl ClusterHandler for GenCommHandler<'_> {
 
         let status = CommissioningErrorEnum::map(ctx.exchange().with_state(|state| {
             state.basic_info_settings.set_location(country_code);
-            state.basic_info_settings.location_type = location_type;
+            state.basic_info_settings.location_type = Some(location_type);
 
             state.failsafe.set_breadcrumb(breadcrumb);
 
-            persist.store_tlv(BASIC_INFO_KEY, &state.basic_info_settings)?;
+            state.basic_info_settings.store_persist(&mut persist)?;
 
             Ok(())
         }))?;
@@ -440,7 +526,7 @@ impl ClusterHandler for GenCommHandler<'_> {
                 // Finally, persist the fabric and the network settings, prior to sending the other party a "success" status
                 persist.store(fabric)?;
                 ctx.networks().access(|networks| {
-                    networks.set_commissioned(true)?;
+                    networks.set_managed(true)?;
 
                     persist
                         .persist_mut()

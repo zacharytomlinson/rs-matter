@@ -19,12 +19,20 @@ use core::num::NonZeroU8;
 
 use embassy_time::Instant;
 
+#[cfg(feature = "persistent-subscriptions")]
+use crate::error::Error;
 use crate::fabric::MAX_FABRICS;
-use crate::im::{AttrId, ClusterId, EndptId, EventId, EventNumber, IMBuffer, NodeId};
+use crate::im::{AttrId, ClusterId, DeviceLoad, EndptId, EventId, EventNumber, IMBuffer, NodeId};
+#[cfg(feature = "persistent-subscriptions")]
+use crate::persist::{KvBlobStore, PERSISTENT_SUBSCRIPTIONS_START};
+#[cfg(feature = "persistent-subscriptions")]
+use crate::tlv::{FromTLV, OctetStr, Octets, TLVElement, TLVTag, ToTLV};
 use crate::utils::cell::RefCell;
 use crate::utils::init::{init, Init};
 use crate::utils::storage::pooled::Buffers;
 use crate::utils::storage::Vec;
+#[cfg(feature = "persistent-subscriptions")]
+use crate::utils::storage::WriteBuf;
 use crate::utils::sync::blocking::Mutex;
 use crate::utils::sync::{DynBase, Notification};
 
@@ -119,8 +127,17 @@ impl<const N: usize> Subscriptions<N> {
     pub fn init() -> impl Init<Self> {
         init!(Self {
             state <- Mutex::init(RefCell::init(SubscriptionsInner::init())),
-            notification: Notification::new(),
+            notification <- Notification::init(),
         })
+    }
+
+    /// Whether subscription persistence is compiled in.
+    ///
+    /// `true` only when the `persistent-subscriptions` feature is enabled; when it
+    /// is off, the persist/resume machinery is compiled out entirely and this is a
+    /// `const false` that lets the linker drop the callers.
+    pub const fn persist_enabled(&self) -> bool {
+        cfg!(feature = "persistent-subscriptions")
     }
 
     /// Notify the instance that the data of a specific attribute has changed and that it should re-evaluate the subscriptions
@@ -180,6 +197,56 @@ impl<const N: usize> Subscriptions<N> {
         self.notification.notify();
     }
 
+    /// Whether a live subscription exists on `fab_idx` whose subscriber node
+    /// matches `node_id`.
+    ///
+    /// This is the ICD "is this client subscribed?" predicate that decides
+    /// whether a registered client is nudged with a Check-In. Persisted
+    /// subscriptions are re-hydrated into this same table at startup
+    /// (`resume_subscriptions`), so a resumed subscription counts here too — no
+    /// separate "persisted subscription" lookup is needed.
+    pub fn has_subscription_for(&self, fab_idx: NonZeroU8, node_id: NodeId) -> bool {
+        self.state.lock(|internal| {
+            internal
+                .borrow()
+                .subscriptions
+                .iter()
+                .any(|s| s.ids.fab_idx == fab_idx && s.ids.peer_node_id == node_id)
+        })
+    }
+
+    /// A consistent snapshot of the subscription-related figures of
+    /// `GeneralDiagnostics::DeviceLoadStatus`.
+    ///
+    /// The Interaction Model message counters are left at their defaults -
+    /// this type knows nothing about them; see
+    /// [`crate::im::InteractionModel::load_stats`].
+    pub fn load_stats(&self, fab_idx: Option<NonZeroU8>) -> DeviceLoad {
+        self.state.lock(|internal| {
+            let internal = internal.borrow();
+
+            DeviceLoad {
+                // Counts the in-flight subscription too, if any.
+                current_subscriptions: internal.subscriptions_count as _,
+                // Walks the active list, so a subscription that is in-flight at
+                // this instant is not counted - it carries no fabric index
+                // while it sits in the `ReportContext`.
+                current_subscriptions_for_fabric: fab_idx
+                    .map(|fab_idx| {
+                        internal
+                            .subscriptions
+                            .iter()
+                            .filter(|s| s.ids.fab_idx == fab_idx)
+                            .count() as _
+                    })
+                    .unwrap_or(0),
+                // The ID counter is monotonic and hands out 1 first.
+                total_subscriptions_established: internal.next_subscription_id.saturating_sub(1),
+                ..Default::default()
+            }
+        })
+    }
+
     /// Record a fully-global change. Every attribute on every cluster on
     /// every endpoint is treated as changed for the purposes of subscription
     /// reporting. Intended for coarse-grained reset / restart scenarios.
@@ -224,7 +291,6 @@ impl<const N: usize> Subscriptions<N> {
         now: Instant,
         fabric_idx: NonZeroU8,
         peer_node_id: u64,
-        session_id: u32,
         min_int_secs: u16,
         max_int_secs: u16,
         event_numbers_watermark: EventNumber,
@@ -238,7 +304,6 @@ impl<const N: usize> Subscriptions<N> {
             let (sub, buf) = state.add::<B>(
                 fabric_idx,
                 peer_node_id,
-                session_id,
                 min_int_secs,
                 max_int_secs,
                 buffer,
@@ -260,6 +325,8 @@ impl<const N: usize> Subscriptions<N> {
             next_max_seen_attr_change_id,
             next_max_seen_event_number: event_numbers_watermark,
             next_reported_at: now,
+            next_retry_at: Instant::MIN,
+            next_fail_count: 0,
             keep: false,
         })
     }
@@ -366,6 +433,8 @@ impl<const N: usize> Subscriptions<N> {
             next_max_seen_attr_change_id,
             next_max_seen_event_number: event_numbers_watermark,
             next_reported_at: now,
+            next_retry_at: Instant::MIN,
+            next_fail_count: 0,
             keep: false,
         })
     }
@@ -406,6 +475,8 @@ impl<const N: usize> Subscriptions<N> {
         sub.max_seen_attr_change_id = report.next_max_seen_attr_change_id;
         sub.max_seen_event_number = report.next_max_seen_event_number;
         sub.reported_at = report.next_reported_at;
+        sub.retry_at = report.next_retry_at;
+        sub.fail_count = report.next_fail_count;
 
         let keep = report.keep;
 
@@ -423,6 +494,181 @@ impl<const N: usize> Subscriptions<N> {
             let mut state = state.borrow_mut();
             buffers.with(|buffers| f(&mut state, buffers))
         })
+    }
+}
+
+/// Subscription persistence: the whole table is mirrored to (and resumed from)
+/// the key-value store, one record per subscription. Gated as a unit so that a
+/// device that does not want persistence drops it — and the TLV serialization
+/// and key-value store traffic it pulls in — entirely.
+#[cfg(feature = "persistent-subscriptions")]
+impl<const N: usize> Subscriptions<N> {
+    /// Persist the whole subscription table to `kv`, one record per key.
+    ///
+    /// Each subscription is written under its own key
+    /// (`PERSISTENT_SUBSCRIPTIONS_START + slot`) so that no single value grows
+    /// beyond one subscribe request, and any keys past the current table length
+    /// are removed. Rewriting the full range keeps the on-disk set an exact
+    /// mirror of the live table without a per-subscription slot allocator;
+    /// subscriptions change rarely, so the write amplification is negligible.
+    ///
+    /// Persistence is best-effort and spec-optional: a subscription whose record does
+    /// not fit in `buf` is simply skipped (logged), not treated as an error.
+    pub(crate) fn persist_all<'a, B, S>(
+        &self,
+        buffers: &SubscriptionsBuffers<'a, B, N>,
+        mut kv: S,
+        buf: &mut [u8],
+    ) -> Result<(), Error>
+    where
+        B: Buffers<IMBuffer> + 'a,
+        S: KvBlobStore,
+    {
+        self.with(buffers, |state, buffers| {
+            for (slot, (sub, rx)) in state
+                .subscriptions
+                .iter()
+                .zip(buffers.iter())
+                .take(N)
+                .enumerate()
+            {
+                let key = PERSISTENT_SUBSCRIPTIONS_START + slot as u16;
+
+                let record = PersistedSubscription {
+                    fab_idx: sub.ids.fab_idx,
+                    peer_node_id: sub.ids.peer_node_id,
+                    min_int_secs: sub.min_int_secs,
+                    max_int_secs: sub.max_int_secs,
+                    subscribe_req: Octets(rx.as_ref()),
+                };
+
+                // Serialize into the front of `buf`, leaving the tail as the store's
+                // scratch (mirrors `Persist::store`). If it does not fit, skip it —
+                // persisting is optional, so a too-large subscription is simply not
+                // resumable across a reboot.
+                let mut wb = WriteBuf::new(buf);
+                if record.to_tlv(&TLVTag::Anonymous, &mut wb).is_err() {
+                    warn!(
+                        "Subscription {:?} too large to persist; skipping",
+                        sub.ids()
+                    );
+                    continue;
+                }
+
+                let len = wb.get_tail();
+                let (data, scratch) = buf.split_at_mut(len);
+                kv.store(key, data, scratch)?;
+            }
+
+            // Drop the tail keys that a now-shorter table no longer occupies.
+            for slot in state.subscriptions.len()..N {
+                let key = PERSISTENT_SUBSCRIPTIONS_START + slot as u16;
+                kv.remove(key, buf)?;
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Re-hydrate the subscription table from `kv`, replaying each persisted record
+    /// through [`Self::add`] exactly as if the subscribe request had just arrived.
+    ///
+    /// Each reloaded subscription enters the table un-primed, so the reporter sends
+    /// it a prompt priming report (establishing a session on demand) rather than
+    /// waiting toward its max-interval deadline — see the priming note in the body
+    /// for why that timing matters. A record that cannot be re-added (e.g. no free
+    /// buffer) is skipped.
+    pub(crate) fn load_persist<'a, 's, B, S>(
+        &'s self,
+        pool: &'a B,
+        buffers: &'s SubscriptionsBuffers<'a, B, N>,
+        mut kv: S,
+        buf: &mut [u8],
+        now: Instant,
+        event_numbers_watermark: EventNumber,
+    ) -> Result<(), Error>
+    where
+        'a: 's,
+        B: Buffers<IMBuffer> + 'a,
+        S: KvBlobStore,
+    {
+        for slot in 0..N {
+            let key = PERSISTENT_SUBSCRIPTIONS_START + slot as u16;
+
+            let Some(data) = kv.load(key, buf)? else {
+                // The range is contiguous: the first empty slot ends the set.
+                break;
+            };
+
+            let record = PersistedSubscription::from_tlv(&TLVElement::new(data))?;
+
+            let Some(mut rx) = pool.get_immediate() else {
+                warn!("No free buffer to resume a persisted subscription; skipping");
+                continue;
+            };
+            rx.clear();
+            if rx.extend_from_slice(record.subscribe_req.0).is_err() {
+                warn!("Persisted subscription too large for an RX buffer; skipping");
+                continue;
+            }
+
+            let added = self.add(
+                now,
+                record.fab_idx,
+                record.peer_node_id,
+                record.min_int_secs,
+                record.max_int_secs,
+                event_numbers_watermark,
+                rx,
+                buffers,
+            );
+
+            match added {
+                Some(mut rctx) => {
+                    // Commit it into the table as an un-primed subscription so the
+                    // reporter sends a full priming report to the subscriber right
+                    // away (establishing a session on demand), rather than staying
+                    // silent until the max-interval liveness point.
+                    //
+                    // This is essential, not cosmetic: the *subscriber* measures its
+                    // own liveness timeout from the last report IT received, not from
+                    // our reboot. If we waited toward our own max-interval deadline,
+                    // the subscriber — whose clock has been running the whole time we
+                    // were down — could already have torn the subscription down. A
+                    // prompt priming report resets the subscriber's liveness clock and
+                    // re-syncs the state it missed while we were away.
+                    //
+                    // Leaving `reported_at` at the `Instant::MAX` priming sentinel
+                    // (rather than stamping it with `now`) is what marks it un-primed.
+                    rctx.next_reported_at = Instant::MAX;
+                    rctx.set_keep();
+                    info!(
+                        "Resumed persisted subscription {:?}",
+                        rctx.subscription().ids()
+                    );
+                }
+                None => {
+                    warn!("Subscription table full while resuming; dropping a persisted record")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove every persisted subscription record from `kv`.
+    ///
+    /// Used on a factory reset, and to clear the range before it is re-hydrated.
+    pub(crate) fn reset_persist<S>(&self, mut kv: S, buf: &mut [u8]) -> Result<(), Error>
+    where
+        S: KvBlobStore,
+    {
+        for slot in 0..N {
+            let key = PERSISTENT_SUBSCRIPTIONS_START + slot as u16;
+            kv.remove(key, buf)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -514,7 +760,6 @@ impl<const N: usize> SubscriptionsInner<N> {
         &mut self,
         fab_idx: NonZeroU8,
         peer_node_id: u64,
-        session_id: u32,
         min_int_secs: u16,
         max_int_secs: u16,
         buffer: B::Buffer<'a>,
@@ -542,10 +787,11 @@ impl<const N: usize> SubscriptionsInner<N> {
                 fab_idx,
                 peer_node_id,
             },
-            session_id,
             min_int_secs,
             max_int_secs,
             reported_at: Instant::MAX,
+            retry_at: Instant::MIN,
+            fail_count: 0,
             max_seen_attr_change_id,
             // Start at 0 so the priming report delivers every event that was
             // already in the event buffer at subscribe time. The reader will
@@ -703,26 +949,50 @@ pub struct SubscriptionIds {
     pub peer_node_id: NodeId,
 }
 
+/// The on-disk form of a single subscription.
+///
+/// One record is stored per subscription under its own key (see
+/// [`PERSISTENT_SUBSCRIPTIONS_START`]), so the value never grows beyond a single
+/// subscribe request. Everything the reporter needs to resume the subscription
+/// is captured here: the routing `(fab_idx, peer_node_id)`, the negotiated
+/// intervals, and the raw `SubscribeReq` TLV — the same bytes the live
+/// subscription keeps in its RX buffer and re-parses on every report, so no
+/// separate path list is serialized.
+#[cfg(feature = "persistent-subscriptions")]
+#[derive(Debug, FromTLV, ToTLV)]
+#[tlvargs(lifetime = "'a")]
+struct PersistedSubscription<'a> {
+    fab_idx: NonZeroU8,
+    peer_node_id: NodeId,
+    min_int_secs: u16,
+    max_int_secs: u16,
+    /// The raw `SubscribeReq` TLV that created this subscription (its selected
+    /// attribute/event paths and fabric-filtered flag live inside it).
+    subscribe_req: OctetStr<'a>,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Subscription {
     /// The IDs of the subscription
     ids: SubscriptionIds,
-    /// The ID of the session on which the subscription was accepted. Used by
-    /// the reporter task to route outgoing reports back to the exact session
-    /// the subscriber established, rather than picking any secure session
-    /// matching `(fab_idx, peer_node_id)` (which may not be the one the peer
-    /// is actually listening on, breaking at least HomeKit and chip-tool).
-    session_id: u32,
     /// The minimum interval in seconds. The subscription should not receive reports more frequently than this interval, but may receive them less frequently.
     /// We use u16 instead of embassy::Duration to save some storage
     min_int_secs: u16,
     /// The maximum interval in seconds. The subscription should receive reports at least this frequently, even if there are no changes to report (i.e. it is a liveness deadline).
     /// We use u16 instead of embassy::Duration to save some storage
     max_int_secs: u16,
-    /// The timestamp of the last report sent to this subscription. Used to decide when the next report is due based on the min/max intervals.
-    /// Set to `Instant::MAX` when the subscription is created to indicate that no report has been sent yet, so the first report is due immediately. After the first report, it is updated to the actual timestamp of the last report.
+    /// The timestamp of the last SUCCESSFUL report sent to this subscription. Used to decide when the next report is due based on the min/max intervals — and, crucially, when to give up: `is_expired` measures `max_int` from here, so a run of *failed* reports (which do NOT advance it) eventually expires the subscription rather than retrying forever.
+    /// Set to `Instant::MAX` when the subscription is created to indicate that no report has been sent yet, so the first report is due immediately. After the first successful report, it is updated to the actual timestamp of that report.
     reported_at: Instant,
+    /// Earliest instant at which a report may be attempted again after a *failed*
+    /// send (see [`ReportContext::set_keep_retry`]). `Instant::MIN` means no retry
+    /// is pending (normal operation). Gates the report-timing helpers so a peer we
+    /// cannot reach is retried with a growing back-off instead of in a tight loop.
+    retry_at: Instant,
+    /// Number of consecutive failed report attempts, driving the retry back-off.
+    /// Reset to `0` on any successful report.
+    fail_count: u8,
     /// The largest attribute change ID from the [`ChangedAttributes`] table this subscription
     /// has already reported on. Entries with a larger change ID represent pending changes the subscription still needs to emit.
     max_seen_attr_change_id: u64,
@@ -736,17 +1006,30 @@ impl Subscription {
         &self.ids
     }
 
-    /// Return the session ID on which this subscription was accepted.
-    pub const fn session_id(&self) -> u32 {
-        self.session_id
-    }
-
     /// Return `true` if the subscription is expired and should be removed, or `false` if it is still active.
     pub fn is_expired(&self, now: Instant) -> bool {
         self.reported_at
             .checked_add(embassy_time::Duration::from_secs(self.max_int_secs as _))
             .map(|expiry| expiry <= now)
             .unwrap_or(false)
+    }
+
+    /// The back-off (in seconds) to wait before the `fail_count`-th consecutive
+    /// retry of a failed report.
+    ///
+    /// Exponential — `BASE * 2^(fail_count - 1)` — capped at `max_int`: it never
+    /// helps to wait longer than the point at which [`Self::is_expired`] gives up
+    /// on the subscription. The cap also means the subscription is guaranteed to
+    /// expire (from the pinned `reported_at`) rather than back off indefinitely.
+    fn retry_backoff_secs(fail_count: u8, max_int_secs: u16) -> u16 {
+        /// First retry delay. Small enough to recover quickly from a transient
+        /// blip, large enough not to hammer an unreachable peer.
+        const BASE_SECS: u16 = 2;
+
+        let shift = fail_count.saturating_sub(1).min(15);
+        let delay = (BASE_SECS as u32) << shift;
+
+        delay.min(max_int_secs.max(BASE_SECS) as u32) as u16
     }
 
     /// Return `true` if the subscription is due for a report based on the given parameters, or `false` if it is not.
@@ -774,9 +1057,22 @@ impl Subscription {
     /// and a point infinitely in the past reads correctly as "always allowed"
     /// for every consumer (the boolean gate below and `next_report_at`).
     fn report_allowed_at(&self) -> Instant {
-        self.reported_at
-            .checked_add(embassy_time::Duration::from_secs(self.min_int_secs as _))
-            .unwrap_or(Instant::MIN)
+        // A pending retry after a failed send is a hard floor on the next
+        // attempt, even for a not-yet-primed subscription — otherwise a peer we
+        // cannot reach would be retried in a tight loop.
+        let min_int_gate = if self.reported_at == Instant::MAX {
+            // Not yet primed: always allowed. This must be an explicit check, not
+            // a reliance on `checked_add` saturating — with `min_int_secs == 0`
+            // the add is `Instant::MAX + 0`, which does NOT overflow and would
+            // wrongly yield `Instant::MAX` ("never allowed").
+            Instant::MIN
+        } else {
+            self.reported_at
+                .checked_add(embassy_time::Duration::from_secs(self.min_int_secs as _))
+                .unwrap_or(Instant::MIN)
+        };
+
+        min_int_gate.max(self.retry_at)
     }
 
     /// Return `true` if the subscription is allowed to report based on the min interval, or `false` if it is still in the quiet period since the last report.
@@ -795,6 +1091,12 @@ impl Subscription {
     /// fresh subscription is immediately due for its priming report (see
     /// [`Self::report_allowed_at`] for why `MIN` is the right sentinel).
     fn report_due_at(&self) -> Instant {
+        // Not yet primed: always due (explicit, for the same reason as
+        // `report_allowed_at`).
+        if self.reported_at == Instant::MAX {
+            return Instant::MIN;
+        }
+
         self.reported_at
             .checked_add(embassy_time::Duration::from_secs(
                 (self.max_int_secs - self.max_int_secs / 2) as _,
@@ -1274,6 +1576,13 @@ where
     /// This is captured here because the subscription's own `next_reported_at`
     /// is not updated until the report completes as it is until then still used.
     next_reported_at: Instant,
+    /// The next retry-gate to commit onto the subscription on completion.
+    /// `Instant::MIN` (the default) clears any pending retry; a failed send
+    /// ([`Self::set_keep_retry`]) sets it to a backed-off future instant.
+    next_retry_at: Instant,
+    /// The next consecutive-failure count to commit. `0` (the default) clears the
+    /// back-off; a failed send sets it to one more than the subscription's.
+    next_fail_count: u8,
     /// Whether the subscription should be kept in the table after the report completes.
     /// Set by the report handler if the other peer acknowledges the data reported by the subscription.
     keep: bool,
@@ -1344,6 +1653,59 @@ where
     /// Mark the subscription to be kept in the table after the report completes,
     /// meaning the other peer acknowledged our report.
     pub fn set_keep(&mut self) {
+        self.keep = true;
+    }
+
+    /// Keep the subscription in the table after a *failed* send to the peer, so it
+    /// retries — with a back-off, and without advancing its watermarks or its
+    /// last-success timestamp.
+    ///
+    /// Three things happen, each of which matters:
+    /// - **Watermarks are preserved.** [`Self::set_keep`] is only correct after a
+    ///   delivered report: `report()` captured the current change/event watermarks
+    ///   as "what this report covers", and committing them would mark the
+    ///   still-unsent changes/events as seen — they would then never be reported.
+    ///   We restore the last actually-reported values so the pending data is
+    ///   re-attempted.
+    /// - **`reported_at` is preserved** (not advanced to now). `is_expired`
+    ///   measures `max_int` from `reported_at`, so keeping it pinned to the last
+    ///   *successful* report means a run of failures eventually expires the
+    ///   subscription instead of retrying it forever.
+    /// - **A back-off is scheduled.** `retry_at` is pushed to a growing (capped)
+    ///   delay from now, so an unreachable peer is retried with exponential
+    ///   back-off rather than in a tight loop that would flood the network.
+    pub fn set_keep_retry(&mut self) {
+        // Snapshot the values we need off the (borrowed) subscription first, so
+        // the writes below don't conflict with the borrow.
+        let sub = self.subscription();
+        let (last_attr, last_event, last_reported_at, max_int_secs, fail_count) = (
+            sub.max_seen_attr_change_id,
+            sub.max_seen_event_number,
+            sub.reported_at,
+            sub.max_int_secs,
+            sub.fail_count.saturating_add(1),
+        );
+
+        // The report context's "now" — the instant of *this* (failed) attempt —
+        // was captured into `next_reported_at` at construction. Read it before we
+        // overwrite that field with the preserved last-success timestamp below.
+        let now = self.next_reported_at;
+
+        // Preserve watermarks + last-success timestamp (so pending data is
+        // re-attempted and `is_expired` still measures from the last success).
+        self.next_max_seen_attr_change_id = last_attr;
+        self.next_max_seen_event_number = last_event;
+        self.next_reported_at = last_reported_at;
+
+        // Grow the back-off from now. The delay is capped at the subscription's
+        // max interval: it never makes sense to wait longer than the point at
+        // which `is_expired` gives up on the subscription anyway.
+        self.next_fail_count = fail_count;
+        let backoff_secs = Subscription::retry_backoff_secs(fail_count, max_int_secs);
+        self.next_retry_at = now
+            .checked_add(embassy_time::Duration::from_secs(backoff_secs as _))
+            .unwrap_or(Instant::MAX);
+
         self.keep = true;
     }
 }
@@ -1952,7 +2314,6 @@ mod tests {
                 now,
                 fab(1),
                 10,
-                100,
                 1,
                 60,
                 0,
@@ -1965,7 +2326,6 @@ mod tests {
                 now,
                 fab(1),
                 10,
-                100,
                 1,
                 60,
                 0,
@@ -1982,7 +2342,6 @@ mod tests {
                 now,
                 fab(1),
                 10,
-                100,
                 1,
                 60,
                 0,
@@ -2007,7 +2366,6 @@ mod tests {
                     now,
                     fab(1),
                     10,
-                    100,
                     1,
                     60,
                     0,
@@ -2037,6 +2395,271 @@ mod tests {
         // change, so only the new (1, 2, 4) is pending.
         assert!(!rctx.should_report_attr(1, 2, 3));
         assert!(rctx.should_report_attr(1, 2, 4));
+    }
+
+    /// A failed report (`set_failed`) keeps the subscription but must NOT advance
+    /// its watermark, so the changes it was carrying stay pending and are
+    /// re-attempted on the next report. Contrast with `set_keep`, which commits
+    /// the advanced watermark (correct only after a *delivered* report).
+    #[test]
+    fn failed_report_preserves_pending_changes() {
+        let subs: Subscriptions<2> = Subscriptions::new();
+        let pool = TestPool::<3>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<3>, 2> = SubscriptionsBuffers::new();
+
+        let now = Instant::now();
+
+        // Prime the subscription (delivered) so it is a normal, non-priming entry.
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, now, 1, 10, 1, 60);
+            rctx.set_keep();
+        }
+
+        // A change becomes pending.
+        subs.notify_attr_changed(1, 2, 3);
+
+        let later = now + Duration::from_secs(2);
+
+        // First report attempt FAILS: the report was carrying (1, 2, 3) but never
+        // reached the subscriber.
+        {
+            let mut rctx = subs.report(later, 0, &subs_bufs).unwrap();
+            assert!(rctx.should_report_attr(1, 2, 3), "change is pending");
+            rctx.set_keep_retry();
+        }
+
+        // Because the failed report did not advance the watermark, (1, 2, 3) is
+        // STILL pending on the next report — no silent data loss.
+        let later2 = later + Duration::from_secs(2);
+        {
+            let rctx = subs.report(later2, 0, &subs_bufs).unwrap();
+            assert!(
+                rctx.should_report_attr(1, 2, 3),
+                "a failed report must not consume the pending change"
+            );
+        }
+    }
+
+    /// The success counterpart: `set_keep` after a delivered report DOES advance
+    /// the watermark, so the same change is not reported again.
+    #[test]
+    fn delivered_report_consumes_pending_changes() {
+        let subs: Subscriptions<2> = Subscriptions::new();
+        let pool = TestPool::<3>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<3>, 2> = SubscriptionsBuffers::new();
+
+        let now = Instant::now();
+
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, now, 1, 10, 1, 60);
+            rctx.set_keep();
+        }
+
+        subs.notify_attr_changed(1, 2, 3);
+
+        let later = now + Duration::from_secs(2);
+        {
+            let mut rctx = subs.report(later, 0, &subs_bufs).unwrap();
+            assert!(rctx.should_report_attr(1, 2, 3));
+            rctx.set_keep(); // delivered
+        }
+
+        // The change was consumed by the delivered report and the liveness
+        // deadline is not yet reached, so there is nothing left to report.
+        let later2 = later + Duration::from_secs(2);
+        assert!(
+            subs.report(later2, 0, &subs_bufs).is_none(),
+            "a delivered report consumes the pending change"
+        );
+    }
+
+    /// A failed report must not busy-loop: even with a change pending and
+    /// `min_int` elapsed, the subscription is held back until its back-off
+    /// (`retry_at`) elapses, and the reporter's wake deadline reflects that.
+    #[test]
+    fn failed_report_backs_off_instead_of_busy_looping() {
+        let subs: Subscriptions<1> = Subscriptions::new();
+        let pool = TestPool::<2>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<2>, 1> = SubscriptionsBuffers::new();
+
+        let now = Instant::now();
+
+        // Prime (delivered), then make a change pending, all with min_int = 1s.
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, now, 1, 10, 1, 600);
+            rctx.set_keep();
+        }
+        subs.notify_attr_changed(1, 2, 3);
+
+        // min_int has elapsed and the change is pending — the report is due, but
+        // it FAILS.
+        let t1 = now + Duration::from_secs(2);
+        {
+            let mut rctx = subs.report(t1, 0, &subs_bufs).unwrap();
+            rctx.set_keep_retry();
+        }
+
+        // Immediately after the failure the subscription is NOT reportable again,
+        // even though the change is still pending and min_int is long past: the
+        // back-off gates it. This is the anti-busy-loop guarantee.
+        assert!(
+            subs.report(t1, 0, &subs_bufs).is_none(),
+            "a failed report must not be retried in the same instant"
+        );
+        // Still gated a moment later (BASE back-off is 2s).
+        assert!(subs
+            .report(t1 + Duration::from_millis(500), 0, &subs_bufs)
+            .is_none());
+
+        // The reporter's wake deadline is pushed to the back-off point, so the
+        // loop sleeps rather than spinning.
+        assert_eq!(
+            subs.next_report_at(0, &subs_bufs),
+            t1 + Duration::from_secs(2),
+            "wake is scheduled at the back-off point, not immediately"
+        );
+
+        // Once the back-off elapses the pending change is retried.
+        let t2 = t1 + Duration::from_secs(2);
+        {
+            let rctx = subs.report(t2, 0, &subs_bufs).unwrap();
+            assert!(
+                rctx.should_report_attr(1, 2, 3),
+                "pending change is retried"
+            );
+        }
+    }
+
+    /// The back-off grows with consecutive failures (exponential from BASE),
+    /// observable through the reporter's wake deadline.
+    #[test]
+    fn repeated_failures_grow_the_backoff() {
+        let subs: Subscriptions<1> = Subscriptions::new();
+        let pool = TestPool::<2>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<2>, 1> = SubscriptionsBuffers::new();
+
+        let now = Instant::now();
+        // Large max_int so the cap never clips the small back-offs under test.
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, now, 1, 10, 1, 600);
+            rctx.set_keep();
+        }
+        subs.notify_attr_changed(1, 2, 3);
+
+        // BASE = 2s, doubling each consecutive failure: 2s, 4s, 8s.
+        let mut t = now + Duration::from_secs(2);
+        for expected_backoff in [2u64, 4, 8] {
+            let mut rctx = subs.report(t, 0, &subs_bufs).unwrap();
+            rctx.set_keep_retry();
+            drop(rctx);
+
+            assert_eq!(
+                subs.next_report_at(0, &subs_bufs),
+                t + Duration::from_secs(expected_backoff),
+                "back-off after this failure",
+            );
+
+            // Advance exactly to the back-off point for the next failed attempt.
+            t += Duration::from_secs(expected_backoff);
+        }
+    }
+
+    /// The back-off never exceeds `max_int`: it makes no sense to wait past the
+    /// point at which the subscription expires anyway.
+    #[test]
+    fn backoff_is_capped_at_max_int() {
+        // With max_int = 5s, even a high fail count is clamped to 5s.
+        assert_eq!(Subscription::retry_backoff_secs(1, 5), 2);
+        assert_eq!(Subscription::retry_backoff_secs(3, 5), 5); // 8 -> capped to 5
+        assert_eq!(Subscription::retry_backoff_secs(20, 5), 5); // huge -> capped
+                                                                // With a generous max_int the exponential shows through, then saturates.
+        assert_eq!(Subscription::retry_backoff_secs(1, 600), 2);
+        assert_eq!(Subscription::retry_backoff_secs(4, 600), 16);
+        assert_eq!(Subscription::retry_backoff_secs(100, 600), 600);
+    }
+
+    /// `is_expired` measures `max_int` from the last *successful* report, not
+    /// from the last attempt: a run of failures does NOT keep the subscription
+    /// alive forever — it expires `max_int` after the last success.
+    #[test]
+    fn failures_do_not_postpone_expiry() {
+        let subs: Subscriptions<1> = Subscriptions::new();
+        let pool = TestPool::<2>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<2>, 1> = SubscriptionsBuffers::new();
+
+        let base = Instant::now();
+        // max_int = 10s.
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, base, 1, 10, 1, 10);
+            rctx.set_keep(); // last SUCCESS is at `base`
+        }
+        subs.notify_attr_changed(1, 2, 3);
+
+        // A failed report at base+2s must NOT move the expiry deadline.
+        {
+            let mut rctx = subs
+                .report(base + Duration::from_secs(2), 0, &subs_bufs)
+                .unwrap();
+            rctx.set_keep_retry();
+        }
+
+        // Just short of max_int-since-success: still alive.
+        let before = base + Duration::from_secs(9);
+        assert!(!subs.remove(&subs_bufs, |sub| sub
+            .is_expired(before)
+            .then_some("expired")));
+
+        // At max_int-since-success (measured from `base`, not from the failed
+        // attempt at base+2s): expired.
+        let after = base + Duration::from_secs(10);
+        assert!(
+            subs.remove(&subs_bufs, |sub| sub.is_expired(after).then_some("expired")),
+            "expiry is measured from the last success, not the last attempt"
+        );
+    }
+
+    /// A delivered report after a run of failures clears the back-off: the next
+    /// wake returns to the normal liveness schedule rather than a back-off floor.
+    #[test]
+    fn success_clears_the_backoff() {
+        let subs: Subscriptions<1> = Subscriptions::new();
+        let pool = TestPool::<2>::new();
+        let subs_bufs: SubscriptionsBuffers<TestPool<2>, 1> = SubscriptionsBuffers::new();
+
+        let now = Instant::now();
+        {
+            let mut rctx = add_sub(&subs, &subs_bufs, &pool, now, 1, 10, 1, 60);
+            rctx.set_keep();
+        }
+        subs.notify_attr_changed(1, 2, 3);
+
+        // Two failures build up a back-off.
+        let t1 = now + Duration::from_secs(2);
+        {
+            let mut rctx = subs.report(t1, 0, &subs_bufs).unwrap();
+            rctx.set_keep_retry();
+        }
+        let t2 = t1 + Duration::from_secs(2);
+        {
+            let mut rctx = subs.report(t2, 0, &subs_bufs).unwrap();
+            rctx.set_keep_retry();
+        }
+
+        // Now a delivered report at t3.
+        let t3 = t2 + Duration::from_secs(4);
+        {
+            let mut rctx = subs.report(t3, 0, &subs_bufs).unwrap();
+            assert!(rctx.should_report_attr(1, 2, 3));
+            rctx.set_keep(); // delivered — resets fail_count and retry_at
+        }
+
+        // The back-off is gone: the next wake is the plain liveness point
+        // (reported_at + max_int - max_int/2 = t3 + 30s), with no retry floor.
+        assert_eq!(
+            subs.next_report_at(0, &subs_bufs),
+            t3 + Duration::from_secs(30),
+            "a delivered report clears the back-off"
+        );
     }
 
     // The following tests cover the public API of `Subscriptions` /
@@ -2074,7 +2697,6 @@ mod tests {
             now,
             fab(fab_idx),
             peer_node_id,
-            /* session_id */ 0,
             min_int,
             max_int,
             /* event_numbers_watermark */ 0,
@@ -2467,7 +3089,6 @@ mod tests {
                 now,
                 fab(1),
                 200,
-                0,
                 1,
                 60,
                 0,
@@ -2507,7 +3128,6 @@ mod tests {
                 now,
                 fab(3),
                 302,
-                0,
                 1,
                 60,
                 0,
@@ -2720,6 +3340,239 @@ mod tests {
             assert_eq!(rctx.max_seen_event_number(), 7);
             assert_eq!(rctx.next_max_seen_event_number(), 42);
             rctx.set_keep();
+        }
+    }
+
+    // ---------- persistence ----------
+
+    // Gated as a unit: the persist/resume machinery under test only exists when
+    // the `persistent-subscriptions` feature is enabled.
+    #[cfg(feature = "persistent-subscriptions")]
+    mod persistence {
+        use super::*;
+
+        /// A minimal multi-key in-memory store, enough to test the
+        /// one-record-per-key subscription persist/reload roundtrip.
+        #[derive(Default)]
+        struct MemKv {
+            blobs: std::collections::HashMap<u16, std::vec::Vec<u8>>,
+        }
+
+        impl KvBlobStore for &mut MemKv {
+            fn load<'a>(&mut self, key: u16, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>, Error> {
+                Ok(self.blobs.get(&key).map(|v| {
+                    buf[..v.len()].copy_from_slice(v);
+                    &buf[..v.len()]
+                }))
+            }
+
+            fn store(&mut self, key: u16, data: &[u8], _buf: &mut [u8]) -> Result<(), Error> {
+                self.blobs.insert(key, data.to_vec());
+                Ok(())
+            }
+
+            fn remove(&mut self, key: u16, _buf: &mut [u8]) -> Result<(), Error> {
+                self.blobs.remove(&key);
+                Ok(())
+            }
+        }
+
+        /// Add a subscription whose RX buffer carries `req` (standing in for a raw
+        /// `SubscribeReq` TLV), and commit it into the table.
+        #[allow(clippy::too_many_arguments)]
+        fn add_sub_with_req<'a, 's, const N: usize, const B: usize>(
+            subs: &'s Subscriptions<N>,
+            subs_bufs: &'s SubscriptionsBuffers<'a, TestPool<B>, N>,
+            pool: &'a TestPool<B>,
+            now: Instant,
+            fab_idx: u8,
+            peer_node_id: u64,
+            min_int: u16,
+            max_int: u16,
+            req: &[u8],
+        ) where
+            'a: 's,
+        {
+            let mut rx = pool.get_immediate().unwrap();
+            rx.clear();
+            rx.extend_from_slice(req).unwrap();
+
+            let mut rctx = subs
+                .add(
+                    now,
+                    fab(fab_idx),
+                    peer_node_id,
+                    min_int,
+                    max_int,
+                    0,
+                    rx,
+                    subs_bufs,
+                )
+                .unwrap();
+            // Commit it as a live subscription (`add` already stamped `reported_at`
+            // with `now`, so this is a non-priming entry once kept).
+            rctx.set_keep();
+        }
+
+        /// A subscription persisted by one `Subscriptions` instance is faithfully
+        /// re-hydrated — routing IDs, intervals, and the raw request bytes — into a
+        /// fresh instance, exactly as a reboot would.
+        #[test]
+        fn persist_reload_roundtrip() {
+            let mut kv = MemKv::default();
+            let now = Instant::now();
+
+            // --- First "boot": build a table and persist it. ---
+            {
+                let subs: Subscriptions<4> = Subscriptions::new();
+                let pool = TestPool::<5>::new();
+                let subs_bufs: SubscriptionsBuffers<TestPool<5>, 4> = SubscriptionsBuffers::new();
+
+                add_sub_with_req(
+                    &subs,
+                    &subs_bufs,
+                    &pool,
+                    now,
+                    1,
+                    0xAABB,
+                    1,
+                    60,
+                    &[1, 2, 3, 4],
+                );
+                add_sub_with_req(&subs, &subs_bufs, &pool, now, 2, 0xCCDD, 0, 120, &[9, 8, 7]);
+
+                let mut buf = [0u8; 512];
+                subs.persist_all(&subs_bufs, &mut kv, &mut buf).unwrap();
+            }
+
+            // Two records written; the rest of the reserved range is empty.
+            assert!(kv.blobs.contains_key(&PERSISTENT_SUBSCRIPTIONS_START));
+            assert!(kv.blobs.contains_key(&(PERSISTENT_SUBSCRIPTIONS_START + 1)));
+            assert!(!kv.blobs.contains_key(&(PERSISTENT_SUBSCRIPTIONS_START + 2)));
+
+            // --- Second "boot": a fresh, empty table reloads from the same store. ---
+            let subs2: Subscriptions<4> = Subscriptions::new();
+            let pool2 = TestPool::<5>::new();
+            let subs_bufs2: SubscriptionsBuffers<TestPool<5>, 4> = SubscriptionsBuffers::new();
+
+            let mut buf = [0u8; 512];
+            subs2
+                .load_persist(&pool2, &subs_bufs2, &mut kv, &mut buf, now, 0)
+                .unwrap();
+
+            // Both subscriptions are back, with their routing + intervals intact...
+            subs2.state.lock(|s| {
+                let s = s.borrow();
+                assert_eq!(s.subscriptions.len(), 2);
+
+                let a = s
+                    .subscriptions
+                    .iter()
+                    .find(|x| x.ids.peer_node_id == 0xAABB)
+                    .expect("first sub resumed");
+                assert_eq!(a.ids.fab_idx, fab(1));
+                assert_eq!(a.min_int_secs, 1);
+                assert_eq!(a.max_int_secs, 60);
+
+                let b = s
+                    .subscriptions
+                    .iter()
+                    .find(|x| x.ids.peer_node_id == 0xCCDD)
+                    .expect("second sub resumed");
+                assert_eq!(b.ids.fab_idx, fab(2));
+                assert_eq!(b.min_int_secs, 0);
+                assert_eq!(b.max_int_secs, 120);
+
+                // Resumed subscriptions must be un-primed so the reporter sends a
+                // prompt priming report (resetting the subscriber's own liveness
+                // clock before it can time the subscription out), NOT wait toward
+                // our max-interval deadline.
+                for sub in s.subscriptions.iter() {
+                    assert!(
+                        sub.is_report_due(now),
+                        "resumed sub {:?} should be immediately report-due (primed)",
+                        sub.ids()
+                    );
+                    assert!(sub.is_report_due(now + Duration::from_secs(1)));
+                }
+            });
+
+            // ...and the raw request bytes survived (they live in the parallel buffer
+            // pool, indexed alongside the subscriptions).
+            subs_bufs2.with(|bufs| {
+                let mut reqs: std::vec::Vec<std::vec::Vec<u8>> =
+                    bufs.iter().map(|b| b[..].to_vec()).collect();
+                reqs.sort();
+                assert_eq!(reqs, std::vec![std::vec![1, 2, 3, 4], std::vec![9, 8, 7]]);
+            });
+
+            // The ICD predicate now sees the resumed subscriptions.
+            assert!(subs2.has_subscription_for(fab(1), 0xAABB));
+            assert!(subs2.has_subscription_for(fab(2), 0xCCDD));
+            assert!(!subs2.has_subscription_for(fab(1), 0x9999));
+        }
+
+        /// Removing a subscription and re-persisting drops exactly its record from
+        /// the store (the table stays an exact mirror of what is on disk).
+        #[test]
+        fn persist_mirrors_removal() {
+            let mut kv = MemKv::default();
+            let now = Instant::now();
+
+            let subs: Subscriptions<4> = Subscriptions::new();
+            let pool = TestPool::<5>::new();
+            let subs_bufs: SubscriptionsBuffers<TestPool<5>, 4> = SubscriptionsBuffers::new();
+
+            add_sub_with_req(&subs, &subs_bufs, &pool, now, 1, 100, 1, 60, &[1]);
+            add_sub_with_req(&subs, &subs_bufs, &pool, now, 1, 101, 1, 60, &[2]);
+            add_sub_with_req(&subs, &subs_bufs, &pool, now, 2, 102, 1, 60, &[3]);
+
+            let mut buf = [0u8; 512];
+            subs.persist_all(&subs_bufs, &mut kv, &mut buf).unwrap();
+            assert_eq!(kv.blobs.len(), 3);
+
+            // Drop the two fab(1) subscriptions and re-persist.
+            subs.remove(&subs_bufs, |sub| {
+                (sub.ids().fab_idx == fab(1)).then_some("fabric 1 removed")
+            });
+            subs.persist_all(&subs_bufs, &mut kv, &mut buf).unwrap();
+
+            // Only the single surviving record remains on disk.
+            assert_eq!(kv.blobs.len(), 1);
+
+            // And a fresh reload sees exactly that one.
+            let subs2: Subscriptions<4> = Subscriptions::new();
+            let pool2 = TestPool::<5>::new();
+            let subs_bufs2: SubscriptionsBuffers<TestPool<5>, 4> = SubscriptionsBuffers::new();
+            subs2
+                .load_persist(&pool2, &subs_bufs2, &mut kv, &mut buf, now, 0)
+                .unwrap();
+            subs2.state.lock(|s| {
+                let s = s.borrow();
+                assert_eq!(s.subscriptions.len(), 1);
+                assert_eq!(s.subscriptions[0].ids.peer_node_id, 102);
+            });
+        }
+
+        /// `reset_persist` wipes the whole reserved range.
+        #[test]
+        fn reset_persist_clears_all_records() {
+            let mut kv = MemKv::default();
+            let now = Instant::now();
+
+            let subs: Subscriptions<4> = Subscriptions::new();
+            let pool = TestPool::<5>::new();
+            let subs_bufs: SubscriptionsBuffers<TestPool<5>, 4> = SubscriptionsBuffers::new();
+
+            add_sub_with_req(&subs, &subs_bufs, &pool, now, 1, 100, 1, 60, &[1]);
+            add_sub_with_req(&subs, &subs_bufs, &pool, now, 2, 101, 1, 60, &[2]);
+
+            let mut buf = [0u8; 512];
+            subs.persist_all(&subs_bufs, &mut kv, &mut buf).unwrap();
+            assert_eq!(kv.blobs.len(), 2);
+
+            subs.reset_persist(&mut kv, &mut buf).unwrap();
+            assert!(kv.blobs.is_empty());
         }
     }
 }

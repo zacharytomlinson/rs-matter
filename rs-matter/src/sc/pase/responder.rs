@@ -29,7 +29,7 @@ use crate::crypto::{
 use crate::dm::AttrChangeNotifier;
 use crate::error::{Error, ErrorCode};
 use crate::sc::pase::spake2p::{Spake2P, Spake2pRandom, Spake2pRandomRef, Spake2pSessionKeys};
-use crate::sc::{check_opcode, complete_with_status, OpCode, SCStatusCodes};
+use crate::sc::{check_opcode, complete_with_status, expect_opcode, OpCode, SCStatusCodes};
 use crate::tlv::{get_root_node_struct, FromTLV, OctetStr, TLVElement, TagType, ToTLV};
 use crate::transport::exchange::Exchange;
 use crate::transport::session::{ReservedSession, SessionMode};
@@ -66,12 +66,12 @@ impl<'a, C: Crypto> PaseResponder<'a, C> {
         })
     }
 
-    /// Handle a PASE PAKE exchange, where the other peer is the exchange initiator
+    /// Handle a PASE PAKE exchange, where the other peer is the exchange initiator.
     ///
-    /// # Arguments
-    /// - `exchange` - The exchange
-    pub async fn handle(&mut self, exchange: &mut Exchange<'_>) -> Result<(), Error> {
-        let result = self.handle_inner(exchange).await;
+    /// Consumes the exchange: on return the PAKE handshake has either
+    /// completed, been rejected, or aborted, and the exchange is dropped.
+    pub async fn handle(&mut self, mut exchange: Exchange<'_>) -> Result<(), Error> {
+        let result = self.handle_inner(&mut exchange).await;
 
         // Per Matter Core spec, every unsuccessful PAKE
         // handshake within the open commissioning window must be counted; the
@@ -289,7 +289,7 @@ impl<'a, C: Crypto> PaseResponder<'a, C> {
     /// closed between PBKDF and Pake1 and the request was silently
     /// dropped.
     async fn handle_pasepake1(&mut self, exchange: &mut Exchange<'_>) -> Result<bool, Error> {
-        check_opcode(exchange, OpCode::PASEPake1)?;
+        expect_opcode(exchange, OpCode::PASEPake1).await?;
 
         let req = get_root_node_struct(exchange.rx()?.payload())?;
         let pake1 = Pake1::from_tlv(&req)?;
@@ -355,7 +355,7 @@ impl<'a, C: Crypto> PaseResponder<'a, C> {
         exchange: &mut Exchange<'_>,
         mut session: ReservedSession<'_>,
     ) -> Result<bool, Error> {
-        check_opcode(exchange, OpCode::PASEPake3)?;
+        expect_opcode(exchange, OpCode::PASEPake3).await?;
 
         let req = get_root_node_struct(exchange.rx()?.payload())?;
         let pake3 = Pake3::from_tlv(&req)?;
@@ -395,6 +395,7 @@ impl<'a, C: Crypto> PaseResponder<'a, C> {
                     Some(dec_key),
                     Some(enc_key),
                     Some(att_challenge),
+                    None,
                 )?;
 
                 // Complete the reserved session and thus make the `Session` instance

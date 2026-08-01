@@ -9,6 +9,11 @@ on:
     - cron: "50 6 * * *"
   workflow_dispatch:
 
+# Pushing a new commit to a pull request supersedes the run already in flight for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_TOOLCHAIN: stable
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -90,7 +95,7 @@ jobs:
 
       - name: Test
         if: matrix.features == 'os'
-        run: cd rs-matter; cargo test --no-default-features --features ${{matrix.crypto-backend}},${{matrix.features}},async-io,log
+        run: cd rs-matter; cargo test --no-default-features --features ${{matrix.crypto-backend}},${{matrix.features}},async-io,log,groups,case-resumption,max-group-keys-per-fabric-2,max-groups-per-fabric-4
 
       - name: Examples
         if: matrix.features == 'os' && matrix.crypto-backend == 'rustcrypto'

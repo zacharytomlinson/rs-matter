@@ -27,7 +27,9 @@
 //! [`ScenesState`] holds the per-device scene table and per-fabric
 //! `CurrentScene` bookkeeping; the table is persisted as a single
 //! TLV blob under [`SCENES_KEY`] on every successful mutation, and
-//! re-hydrated on startup via [`ScenesState::load_persist`].
+//! re-hydrated on startup via [`ScenesState::load_persist`], driven by
+//! the [`LifecycleOp::Startup`] lifecycle operation the handler receives
+//! (deliver it by calling `InteractionModel::startup` once at startup).
 //!
 //! The `SceneNames` feature is not supported — scene names sent on
 //! the wire are accepted and discarded.
@@ -37,10 +39,10 @@ use core::num::NonZeroU8;
 
 use crate::dm::{
     ArrayAttributeRead, AttrId, Cluster, ClusterId, Dataver, EndptId, HandlerContext,
-    InvokeContext, ReadContext, SceneId,
+    InvokeContext, LifecycleOp, ReadContext, SceneId,
 };
 use crate::error::{Error, ErrorCode};
-use crate::persist::{KvBlobStore, Persist};
+use crate::persist::{KvBlobStore, KvBlobStoreAccess, Persist};
 use crate::tlv::{
     FromTLV, Nullable, OptionalBuilder, TLVArray, TLVBuilder, TLVBuilderParent, TLVElement,
     TLVSequence, TLVTag, TLVWrite, TLVWriteParent, ToTLV, TLV,
@@ -577,15 +579,12 @@ impl<'a, const N: usize, const M: usize> FromTLV<'a> for ScenesStateInner<N, M> 
 
 impl<const N: usize, const M: usize> ScenesState<N, M> {
     /// Re-hydrate the scene table and per-fabric `CurrentScene`
-    /// bookkeeping from `store` under [`SCENES_KEY`]. Call once at
-    /// application startup, before exposing the data model to
-    /// commissioners. A missing key (first boot or cleared
-    /// persistence) leaves the registry empty.
-    pub async fn load_persist<S: KvBlobStore>(
-        &self,
-        mut store: S,
-        buf: &mut [u8],
-    ) -> Result<(), Error> {
+    /// bookkeeping from `store` under [`SCENES_KEY`]. A missing key
+    /// (first boot or cleared persistence) leaves the registry empty.
+    ///
+    /// Called on startup via the [`LifecycleOp::Startup`] lifecycle operation
+    /// delivered to the [`ScenesHandler`] borrowing this state.
+    pub fn load_persist<S: KvBlobStore>(&self, mut store: S, buf: &mut [u8]) -> Result<(), Error> {
         let Some(data) = store.load(SCENES_KEY, buf)? else {
             // Reset to empty so a `load_persist` after a key
             // `remove` is deterministic.
@@ -608,6 +607,44 @@ impl<const N: usize, const M: usize> ScenesState<N, M> {
         info!("Loaded Scenes state from storage ({} entries)", entries);
 
         Ok(())
+    }
+
+    /// Reset the scene table and per-fabric `CurrentScene` bookkeeping to
+    /// empty and remove the persisted blob from `store` (under [`SCENES_KEY`]).
+    ///
+    /// Called on factory reset via the [`LifecycleOp::FactoryReset`] lifecycle
+    /// operation delivered to the [`ScenesHandler`] borrowing this state.
+    pub fn reset_persist<S: KvBlobStore>(&self, mut store: S, buf: &mut [u8]) -> Result<(), Error> {
+        self.with(|inner| {
+            inner.table.clear();
+            inner.current_per_fabric.clear();
+            inner.bump_info_dataver();
+        });
+
+        store.remove(SCENES_KEY, buf)
+    }
+
+    /// Drop every scene-table row and `CurrentScene` slot belonging to
+    /// `fab_idx`, returning whether anything was removed.
+    ///
+    /// Called on fabric removal via the [`LifecycleOp::FabricRemoval`]
+    /// lifecycle operation delivered to the [`ScenesHandler`] instance(s)
+    /// borrowing this state. Idempotent, since each borrowing handler
+    /// instance receives the (broadcast) lifecycle operation.
+    pub fn remove_for_fabric(&self, fab_idx: NonZeroU8) -> bool {
+        self.with(|inner| {
+            let before = inner.table.len() + inner.current_per_fabric.len();
+
+            inner.table.retain(|entry| entry.fab_idx != fab_idx);
+            inner.current_per_fabric.retain(|c| c.fab_idx != fab_idx);
+
+            let removed = inner.table.len() + inner.current_per_fabric.len() < before;
+            if removed {
+                inner.bump_info_dataver();
+            }
+
+            removed
+        })
     }
 
     /// Persist the current state under [`SCENES_KEY`]. Called from
@@ -668,7 +705,7 @@ where
     }
 
     fn fab_idx<C: InvokeContext>(ctx: &C) -> Result<NonZeroU8, Error> {
-        ctx.exchange().accessor()?.fab_idx()
+        ctx.accessor()?.fab_idx()
     }
 
     /// Per-fabric `RemainingCapacity` for `GetSceneMembership` and
@@ -696,14 +733,26 @@ where
         if group_id == 0 {
             return Ok(true);
         }
-        ctx.exchange().with_state(|state| {
-            let fabric = state.fabrics.fabric(fab_idx)?;
-            Ok(fabric
-                .groups()
-                .get(group_id)
-                .map(|g| g.endpoints.contains(&endpoint_id))
-                .unwrap_or(false))
-        })
+
+        #[cfg(feature = "groups")]
+        {
+            ctx.exchange().with_state(|state| {
+                let fabric = state.fabrics.fabric(fab_idx)?;
+                Ok(fabric
+                    .groups()
+                    .get(group_id)
+                    .map(|g| g.endpoints.contains(&endpoint_id))
+                    .unwrap_or(false))
+            })
+        }
+
+        // Without multicast group support a non-zero group can never be in the
+        // (empty) group table.
+        #[cfg(not(feature = "groups"))]
+        {
+            let _ = (ctx, fab_idx, endpoint_id);
+            Ok(false)
+        }
     }
 
     /// Stamp `(endpoint, group, scene)` as the recalled scene for
@@ -894,7 +943,7 @@ where
         builder: ArrayAttributeRead<SceneInfoStructArrayBuilder<P>, SceneInfoStructBuilder<P>>,
     ) -> Result<P, Error> {
         let endpoint_id = ctx.attr().endpoint_id;
-        let accessor_fab_idx = ctx.exchange().accessor()?.fab_idx()?;
+        let accessor_fab_idx = ctx.accessor()?.fab_idx()?;
 
         // Snapshot the relevant scalars under a single lock, then
         // build the response outside the lock. A fabric gets a row
@@ -1598,6 +1647,24 @@ where
 
     fn dataver_changed(&self) {
         self.dataver.changed();
+    }
+
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        match op {
+            LifecycleOp::Startup => ctx
+                .kv()
+                .access(|store, buf| self.state.load_persist(store, buf)),
+            LifecycleOp::FactoryReset => ctx
+                .kv()
+                .access(|store, buf| self.state.reset_persist(store, buf)),
+            LifecycleOp::FabricRemoval { fab_idx } => {
+                if self.state.remove_for_fabric(fab_idx) {
+                    self.state.store_persist(&ctx)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     fn scene_table_size(&self, _ctx: impl ReadContext) -> impl Future<Output = Result<u16, Error>> {

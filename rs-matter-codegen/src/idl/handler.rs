@@ -79,15 +79,15 @@ pub fn handler(
         .map(|cmd| handler_command(cmd, asynch, delegate, entities, &krate));
 
     if delegate {
-        let run = if asynch {
-            quote!(
-                fn run(&self, ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
-                    (**self).run(ctx)
-                }
-            )
-        } else {
-            quote!()
-        };
+        let lifecycle_run = quote!(
+            fn lifecycle(&self, ctx: impl #krate::dm::HandlerContext, op: #krate::dm::LifecycleOp) -> Result<(), #krate::error::Error> {
+                T::lifecycle(self, ctx, op)
+            }
+
+            fn run(&self, ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
+                (**self).run(ctx)
+            }
+        );
 
         quote!(
             impl<T> #handler_name for &T
@@ -99,7 +99,7 @@ pub fn handler(
                 fn dataver(&self) -> u32 { T::dataver(self) }
                 fn dataver_changed(&self) { T::dataver_changed(self) }
 
-                #run
+                #lifecycle_run
 
                 #(#handler_attribute_methods)*
 
@@ -109,15 +109,17 @@ pub fn handler(
             }
         )
     } else {
-        let run = if asynch {
-            quote!(
-                fn run(&self, _ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
-                    core::future::pending::<Result::<(), #krate::error::Error>>()
-                }
-            )
-        } else {
-            quote!()
-        };
+        // `lifecycle` is deliberately synchronous even on the async handler
+        // trait (like `bump_dataver`) - see `AsyncHandler::lifecycle`.
+        let lifecycle_run = quote!(
+            fn lifecycle(&self, _ctx: impl #krate::dm::HandlerContext, _op: #krate::dm::LifecycleOp) -> Result<(), #krate::error::Error> {
+                Ok(())
+            }
+
+            fn run(&self, _ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
+                core::future::pending::<Result::<(), #krate::error::Error>>()
+            }
+        );
 
         quote!(
             #[doc = "The handler trait for the cluster."]
@@ -129,7 +131,7 @@ pub fn handler(
 
                 fn dataver_changed(&self);
 
-                #run
+                #lifecycle_run
 
                 #(#handler_attribute_methods)*
 
@@ -274,15 +276,15 @@ pub fn handler_adaptor(
         )
     };
 
-    let run = if asynch {
-        quote!(
-            fn run(&self, ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
-                self.0.run(ctx)
-            }
-        )
-    } else {
-        quote!()
-    };
+    let lifecycle_run = quote!(
+        fn lifecycle(&self, ctx: impl #krate::dm::HandlerContext, op: #krate::dm::LifecycleOp) -> Result<(), #krate::error::Error> {
+            self.0.lifecycle(ctx, op)
+        }
+
+        fn run(&self, ctx: impl #krate::dm::HandlerContext) -> impl core::future::Future<Output = Result<(), #krate::error::Error>> {
+            self.0.run(ctx)
+        }
+    );
 
     let pasync = if asynch { quote!(async) } else { quote!() };
 
@@ -346,7 +348,7 @@ pub fn handler_adaptor(
                 }
             }
 
-            #run
+            #lifecycle_run
         }
 
         impl<T, Q> core::fmt::Debug for MetadataDebug<(u16, &#handler_adaptor_name<T>, Q)>
@@ -527,7 +529,7 @@ fn handler_attribute_write(
 ) -> TokenStream {
     let attr_name = ident(&format!(
         "set_{}",
-        &idl_field_name_to_rs_name(&attr.field.field.id)
+        idl_field_name_to_rs_name(&attr.field.field.id)
     ));
 
     let (pasync, sawait) = if asynch {
@@ -611,7 +613,7 @@ fn handler_command(
     entities: &EntityContext,
     krate: &Ident,
 ) -> TokenStream {
-    let cmd_name = ident(&format!("handle_{}", &idl_field_name_to_rs_name(&cmd.id)));
+    let cmd_name = ident(&format!("handle_{}", idl_field_name_to_rs_name(&cmd.id)));
 
     let (pasync, sawait) = if asynch {
         (quote!(async), quote!(.await))
@@ -948,7 +950,7 @@ fn handler_adaptor_attribute_write_match(
 
     let attr_method_name = ident(&format!(
         "set_{}",
-        &idl_field_name_to_rs_name(&attr.field.field.id)
+        idl_field_name_to_rs_name(&attr.field.field.id)
     ));
 
     let attr_type = field_type(
@@ -1013,7 +1015,7 @@ fn handler_adaptor_command_match(
     let cmd_debug_id =
         quote!(MetadataDebug((ctx.cmd().endpoint_id, self, MetadataDebug(CommandId::#cmd_name))));
 
-    let cmd_method_name = ident(&format!("handle_{}", &idl_field_name_to_rs_name(&cmd.id)));
+    let cmd_method_name = ident(&format!("handle_{}", idl_field_name_to_rs_name(&cmd.id)));
 
     let sawait = if asynch { quote!(.await) } else { quote!() };
 
@@ -1311,6 +1313,20 @@ mod tests {
                     const CLUSTER: rs_matter_crate::dm::Cluster<'static>;
                     fn dataver(&self) -> u32;
                     fn dataver_changed(&self);
+                    fn lifecycle(
+                        &self,
+                        _ctx: impl rs_matter_crate::dm::HandlerContext,
+                        _op: rs_matter_crate::dm::LifecycleOp,
+                    ) -> Result<(), rs_matter_crate::error::Error> {
+                        Ok(())
+                    }
+                    fn run(
+                        &self,
+                        _ctx: impl rs_matter_crate::dm::HandlerContext,
+                    ) -> impl core::future::Future<Output = Result<(), rs_matter_crate::error::Error>>
+                    {
+                        core::future::pending::<Result<(), rs_matter_crate::error::Error>>()
+                    }
                     fn on_off(
                         &self,
                         ctx: impl rs_matter_crate::dm::ReadContext,
@@ -1408,6 +1424,20 @@ mod tests {
                     }
                     fn dataver_changed(&self) {
                         T::dataver_changed(self)
+                    }
+                    fn lifecycle(
+                        &self,
+                        ctx: impl rs_matter_crate::dm::HandlerContext,
+                        op: rs_matter_crate::dm::LifecycleOp,
+                    ) -> Result<(), rs_matter_crate::error::Error> {
+                        T::lifecycle(self, ctx, op)
+                    }
+                    fn run(
+                        &self,
+                        ctx: impl rs_matter_crate::dm::HandlerContext,
+                    ) -> impl core::future::Future<Output = Result<(), rs_matter_crate::error::Error>>
+                    {
+                        (**self).run(ctx)
                     }
                     fn on_off(
                         &self,
@@ -1984,6 +2014,20 @@ mod tests {
                         if ctx.cluster().map(|c| c == 6u32).unwrap_or(true) {
                             self.0.dataver_changed();
                         }
+                    }
+                    fn lifecycle(
+                        &self,
+                        ctx: impl rs_matter_crate::dm::HandlerContext,
+                        op: rs_matter_crate::dm::LifecycleOp,
+                    ) -> Result<(), rs_matter_crate::error::Error> {
+                        self.0.lifecycle(ctx, op)
+                    }
+                    fn run(
+                        &self,
+                        ctx: impl rs_matter_crate::dm::HandlerContext,
+                    ) -> impl core::future::Future<Output = Result<(), rs_matter_crate::error::Error>>
+                    {
+                        self.0.run(ctx)
                     }
                 }
                 impl<T, Q> core::fmt::Debug for MetadataDebug<(u16, &HandlerAdaptor<T>, Q)>

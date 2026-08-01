@@ -1166,9 +1166,8 @@ fn main() -> Result<(), Error> {
     // Bind the KV access object (the KV scratch buffer lives in `Matter`).
     let kv = matter.kv(store);
 
-    // Re-hydrate the `Matter` instance and the data model state (event-number epoch).
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
-    futures_lite::future::block_on(state.load_persist(&kv))?;
+    // Re-hydrate the `Matter` instance (fabrics, basic info, RTC).
+    matter.startup(&kv)?;
 
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
     let mut rand = crypto.rand()?;
@@ -1303,6 +1302,10 @@ fn main() -> Result<(), Error> {
         state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state and deliver the `Startup` lifecycle op to all cluster handlers.
+    futures_lite::future::block_on(im.startup())?;
+
     let responder = DefaultResponder::new(&im);
     let mut respond = pin!(responder.run::<4, 4>());
     let mut im_job = pin!(im.run());
@@ -1333,7 +1336,7 @@ fn main() -> Result<(), Error> {
     let mut transport = pin!(matter.run(&crypto, &mut net_send, &mut net_recv, &mut net_multicast));
     let mut driver = pin!(shared.drive());
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
         matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
         matter.open_basic_comm_window(MAX_COMM_WINDOW_TIMEOUT_SECS, &crypto, &())?;

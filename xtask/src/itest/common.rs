@@ -27,8 +27,12 @@ use anyhow::{self, Context};
 
 use log::{debug, info, warn};
 
-/// The default Git reference to use for the Chip repository
-pub const CHIP_DEFAULT_GITREF: &str = "v1.5-branch"; //"master";
+/// The default Git reference to use for the Chip repository.
+///
+/// Move to `v1.6.1-branch` only together with the 1.6.1 IDL *and* raising
+/// `DEFAULT_MATTER_SPEC_VERSION` - which additionally requires Groupcast, see
+/// the note on that constant.
+pub const CHIP_DEFAULT_GITREF: &str = "f3af82eb6fd1aed968e04642cb8d2ac305f5a371"; // tip of `v1.6-branch`
 
 /// The tooling that is checked for presence in the command line
 const REQUIRED_TOOLING: &[&str] = &[
@@ -64,11 +68,29 @@ const REQUIRED_PACKAGES: &[&str] = &[
     "libreadline-dev",
     "libssl-dev",
     "libdbus-1-dev",
+    // Provides the `dbus-daemon` binary. The BLE test suite runs `bluezoo` on a
+    // private bus rather than the system one, so it needs the daemon itself and
+    // not just the `-dev` headers above.
+    "dbus",
     "libglib2.0-dev",
     "libavahi-client-dev",
     // Required by `pyscard` (built as part of the CHIP Python wheel):
     // provides `libpcsclite.pc` and `<winscard.h>` (in /usr/include/PCSC/).
     "libpcsclite-dev",
+    // Required by `ot-commissioner`, which `chip-tool` pulls in transitively
+    // for Thread commissioning: provides `<event2/event.h>`. Note the runtime
+    // `libevent-2.1` is usually present already — it is the `-dev` headers that
+    // are missing, and without them the failure appears deep inside the ninja
+    // build of `chip-tool` rather than at dependency-check time.
+    "libevent-dev",
+    // Required by the `ot-br-posix` build (`ChipBuilder::build_otbr`): its
+    // D-Bus API (`-DOTBR_DBUS=ON`) pulls in `src/proto`, whose CMakeLists
+    // does `find_package(Protobuf REQUIRED)`.
+    "libprotobuf-dev",
+    "protobuf-compiler",
+    // Provides `setcap`/`getcap`, used by the thread suite to grant
+    // `otbr-agent` the file capabilities it needs to run unprivileged.
+    "libcap2-bin",
 ];
 
 /// Execute command with stderr always surpressed
@@ -197,6 +219,71 @@ impl ChipBuilder {
         &self.chip_dir
     }
 
+    /// Path of the `chip-tool` binary, relative to the Chip root.
+    pub const CHIP_TOOL: &'static str = "out/host/chip-tool";
+    /// Path of the `chip-all-clusters-app` binary, relative to the Chip root.
+    pub const ALL_CLUSTERS_APP: &'static str = "out/all-clusters/chip-all-clusters-app";
+    /// Path of the `chip-ota-provider-app` binary, relative to the Chip root.
+    pub const OTA_PROVIDER_APP: &'static str = "out/ota-provider/chip-ota-provider-app";
+    /// Path of the `chip-ota-requestor-app` binary, relative to the Chip root.
+    pub const OTA_REQUESTOR_APP: &'static str = "out/ota-requestor/chip-ota-requestor-app";
+
+    /// Absolute path of the `chip-tool` binary.
+    pub fn chip_tool_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::CHIP_TOOL)
+    }
+
+    /// Absolute path of the `chip-all-clusters-app` binary.
+    pub fn all_clusters_app_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::ALL_CLUSTERS_APP)
+    }
+
+    /// Absolute path of the `chip-ota-provider-app` binary.
+    pub fn ota_provider_app_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::OTA_PROVIDER_APP)
+    }
+
+    /// Absolute path of the `chip-ota-requestor-app` binary.
+    pub fn ota_requestor_app_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::OTA_REQUESTOR_APP)
+    }
+
+    /// Path of the `otbr-agent` binary, relative to the Chip root. Built out of
+    /// the `ot-br-posix` submodule vendored in the Chip checkout, with the same
+    /// cmake configuration Chip's own CI uses for its Thread jobs.
+    pub const OTBR_AGENT: &'static str =
+        "third_party/ot-br-posix/repo/build/otbr/src/agent/otbr-agent";
+    /// Path of the `ot-ctl` binary (the OpenThread CLI client for a running
+    /// `otbr-agent`), produced by the same `ot-br-posix` build. Nothing in
+    /// the harness calls it — it is the operator's tool for poking the
+    /// suite's Thread stack by hand (`sudo ot-ctl state`, `dataset active`,
+    /// ...), hence deliberately kept reachable.
+    #[allow(dead_code)]
+    pub const OT_CTL: &'static str =
+        "third_party/ot-br-posix/repo/build/otbr/third_party/openthread/repo/src/posix/ot-ctl";
+    /// Path of the *simulation* `ot-rcp` binary, relative to the Chip root.
+    /// An RCP whose 802.15.4 radio is OpenThread's simulation platform: all
+    /// sim nodes on the host mesh over localhost UDP, so `otbr-agent` can run
+    /// a real Thread stack with no radio hardware.
+    pub const OT_RCP_SIM: &'static str =
+        "third_party/openthread/repo/build/simulation/examples/apps/ncp/ot-rcp";
+
+    /// Absolute path of the `otbr-agent` binary.
+    pub fn otbr_agent_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::OTBR_AGENT)
+    }
+
+    /// Absolute path of the `ot-ctl` binary.
+    #[allow(dead_code)]
+    pub fn ot_ctl_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::OT_CTL)
+    }
+
+    /// Absolute path of the simulation `ot-rcp` binary.
+    pub fn ot_rcp_sim_path(&self) -> PathBuf {
+        self.chip_dir.join(Self::OT_RCP_SIM)
+    }
+
     /// Build the chip_tool binary.
     ///
     /// Handles Chip repo setup if required and acitvates the Chip
@@ -211,16 +298,32 @@ impl ChipBuilder {
         self.setup_chip(chip_dir, chip_gitref, force_rebuild)?;
 
         // Build chip-tool if not cached or force rebuild
-        let chip_tool_path = chip_dir.join("out/host/chip-tool");
+        let chip_tool_path = self.chip_tool_path();
         if !chip_tool_path.exists() || force_rebuild {
             warn!("Building `chip-tool`...");
 
-            self.build_example("examples/chip-tool", "out/host")?;
+            self.build_example("examples/chip-tool", Self::out_dir(Self::CHIP_TOOL))?;
         } else {
             info!("Using existing chip-tool build");
         }
 
         Ok(())
+    }
+
+    /// The gn output directory holding `binary_path`, i.e. everything up to the
+    /// final path component.
+    ///
+    /// Every example gets its own output directory. `gn gen <dir>` writes an
+    /// `args.gn` and a `build.ninja` describing exactly one example's target
+    /// graph, so pointing two examples at the same directory makes each build
+    /// re-generate over the other's configuration: the previously built binary
+    /// is left behind with no rule that can refresh it, and switching back and
+    /// forth re-compiles the world every time.
+    fn out_dir(binary_path: &str) -> &str {
+        Path::new(binary_path)
+            .parent()
+            .and_then(|dir| dir.to_str())
+            .expect("binary paths are `<out-dir>/<binary>`")
     }
 
     /// Build and install the CHIP Python "matter" wheel into the
@@ -351,6 +454,27 @@ impl ChipBuilder {
             !self.print_cmd_output,
         )?;
 
+        // Re-probe rather than trust the build's exit status: `build_python.sh`
+        // can return 0 while its `pip install` of the freshly built wheels
+        // silently fails, leaving a venv without `matter.testing`. That then
+        // surfaces much later as every Python test failing with
+        // `ModuleNotFoundError`, which reads like a product regression instead
+        // of a setup failure. Fail here, where the cause is obvious.
+        let verify = Command::new(venv_dir.join("bin/python3"))
+            .arg("-c")
+            .arg("import matter.testing.metadata, matter.testing.tasks, zeroconf, nest_asyncio")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if !verify.map(|s| s.success()).unwrap_or(false) {
+            anyhow::bail!(
+                "`build_python.sh` completed but the CHIP Python wheel is not importable from {}. \
+                 Re-run with `-v` to surface the build's stderr.",
+                venv_dir.display(),
+            );
+        }
+
         info!("CHIP Python wheel and test requirements installed successfully");
 
         Ok(())
@@ -370,11 +494,14 @@ impl ChipBuilder {
         self.setup_chip(chip_dir, chip_gitref, force_rebuild)?;
 
         // Build chip-all-clusters-app if not cached or force rebuild
-        let app_path = chip_dir.join("out/host/chip-all-clusters-app");
+        let app_path = self.all_clusters_app_path();
         if !app_path.exists() || force_rebuild {
             warn!("Building chip-all-clusters-app...");
 
-            self.build_example("examples/all-clusters-app/linux", "out/host")?;
+            self.build_example(
+                "examples/all-clusters-app/linux",
+                Self::out_dir(Self::ALL_CLUSTERS_APP),
+            )?;
         } else {
             info!("Using existing chip-all-clusters-app build");
         }
@@ -394,11 +521,14 @@ impl ChipBuilder {
 
         self.setup_chip(chip_dir, chip_gitref, force_rebuild)?;
 
-        let app_path = chip_dir.join("out/host/chip-ota-provider-app");
+        let app_path = self.ota_provider_app_path();
         if !app_path.exists() || force_rebuild {
             warn!("Building chip-ota-provider-app...");
 
-            self.build_example("examples/ota-provider-app/linux", "out/host")?;
+            self.build_example(
+                "examples/ota-provider-app/linux",
+                Self::out_dir(Self::OTA_PROVIDER_APP),
+            )?;
         } else {
             info!("Using existing chip-ota-provider-app build");
         }
@@ -418,13 +548,127 @@ impl ChipBuilder {
 
         self.setup_chip(chip_dir, chip_gitref, force_rebuild)?;
 
-        let app_path = chip_dir.join("out/host/chip-ota-requestor-app");
+        let app_path = self.ota_requestor_app_path();
         if !app_path.exists() || force_rebuild {
             warn!("Building chip-ota-requestor-app...");
 
-            self.build_example("examples/ota-requestor-app/linux", "out/host")?;
+            self.build_example(
+                "examples/ota-requestor-app/linux",
+                Self::out_dir(Self::OTA_REQUESTOR_APP),
+            )?;
         } else {
             info!("Using existing chip-ota-requestor-app build");
+        }
+
+        Ok(())
+    }
+
+    /// Build `otbr-agent` + `ot-ctl` (from the vendored `ot-br-posix`
+    /// submodule) and the simulation `ot-rcp` (from the vendored `openthread`
+    /// submodule). Together they let the Thread integration suite run a real
+    /// Thread stack with no radio hardware; a real RCP dongle replaces only
+    /// the `ot-rcp` piece, via the radio URL.
+    ///
+    /// The cmake invocations mirror Chip CI's "Build OpenThread dependencies
+    /// for commissioning tests" step (`.github/workflows/tests.yaml`), so the
+    /// binaries match what upstream's own Thread jobs run against. Both build
+    /// trees live inside the Chip checkout, so the CI cache picks them up.
+    pub fn build_otbr(&self, chip_gitref: Option<&str>, force_rebuild: bool) -> anyhow::Result<()> {
+        let chip_dir = self.chip_dir();
+
+        self.setup_chip(chip_dir, chip_gitref, force_rebuild)?;
+
+        if !self.otbr_agent_path().exists() || force_rebuild {
+            warn!("Building otbr-agent + ot-ctl (this may take several minutes)...");
+
+            // Deliberately a PLAIN shell, not `run_in_build_env.sh`: the
+            // otbr build needs only system cmake/ninja/git, and the pigweed
+            // environment carries its own (newer) `protoc`, which cmake's
+            // `FindProtobuf` then pairs with the *system* libprotobuf headers
+            // — the generated `.pb.cc` files include
+            // `google/protobuf/runtime_version.h`, which those headers do not
+            // have. Outside the env, system protoc and system headers match.
+            //
+            // `OT_POSIX_SETTINGS_PATH='"tmp"'` (a *relative* path, quoted for
+            // the C preprocessor) is upstream's CI value: the agent stores its
+            // Thread settings under `<cwd>/tmp`, which keeps runs hermetic as
+            // long as the agent is started from a scratch directory.
+            //
+            // The daemon-socket basename moves from its `/run/openthread-%s`
+            // default to `/tmp`: the suite runs `otbr-agent` as a regular
+            // user (with `cap_net_admin` file capabilities rather than root —
+            // see `OtbrEnv`), and `/run` is not writable for it. The value is
+            // a `#ifndef` default with no cmake option of its own, hence the
+            // compiler-flag override; `ot-ctl` picks the same header up, so
+            // client and daemon agree on the path.
+            let cmd_line = r#"cd third_party/ot-br-posix/repo && \
+                git submodule update --init --recursive --depth 1 && \
+                PLATFORM=Linux ./script/cmake-build \
+                -DBUILD_TESTING=OFF \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DOTBR_BORDER_ROUTING=ON \
+                -DOTBR_DBUS=ON \
+                -DOTBR_MDNS=openthread \
+                -DOTBR_VENDOR_NAME=MatterTest \
+                -DOTBR_PRODUCT_NAME=MatterTest \
+                -DOT_POSIX_SETTINGS_PATH='"tmp"' \
+                -DCMAKE_C_FLAGS='-DOPENTHREAD_POSIX_CONFIG_DAEMON_SOCKET_BASENAME=\"/tmp/openthread-%s\"' \
+                -DCMAKE_CXX_FLAGS='-DOPENTHREAD_POSIX_CONFIG_DAEMON_SOCKET_BASENAME=\"/tmp/openthread-%s\"' \
+                -DOT_FIREWALL=OFF \
+                -DOT_LOG_LEVEL=INFO \
+                -DOT_TREL=OFF"#;
+
+            run_command_with(
+                Command::new("bash")
+                    .current_dir(chip_dir)
+                    .arg("-c")
+                    .arg(cmd_line),
+                self.print_cmd_output,
+                !self.print_cmd_output,
+            )?;
+
+            if !self.otbr_agent_path().exists() {
+                anyhow::bail!(
+                    "`ot-br-posix` build completed but `otbr-agent` is not at {}",
+                    self.otbr_agent_path().display()
+                );
+            }
+        } else {
+            info!("Using existing otbr-agent build");
+        }
+
+        if !self.ot_rcp_sim_path().exists() || force_rebuild {
+            warn!("Building simulation ot-rcp...");
+
+            // Plain shell for the same reason as the otbr-agent build above.
+            let cmd_line = r#"cd third_party/openthread/repo && \
+                ./script/cmake-build simulation \
+                -DBUILD_TESTING=OFF \
+                -DOT_BUILD_GTEST=OFF \
+                -DOT_FTD=OFF \
+                -DOT_MTD=OFF \
+                -DOT_RCP=ON \
+                -DOT_APP_CLI=OFF \
+                -DOT_APP_NCP=OFF \
+                -DOT_APP_RCP=ON"#;
+
+            run_command_with(
+                Command::new("bash")
+                    .current_dir(chip_dir)
+                    .arg("-c")
+                    .arg(cmd_line),
+                self.print_cmd_output,
+                !self.print_cmd_output,
+            )?;
+
+            if !self.ot_rcp_sim_path().exists() {
+                anyhow::bail!(
+                    "`openthread` simulation build completed but `ot-rcp` is not at {}",
+                    self.ot_rcp_sim_path().display()
+                );
+            }
+        } else {
+            info!("Using existing simulation ot-rcp build");
         }
 
         Ok(())
@@ -482,6 +726,13 @@ impl ChipBuilder {
             // (e.g. `v1.5-branch`) is followed rather than pinned to whatever
             // commit was first cloned. Best-effort — an offline fetch failure
             // just leaves the existing checkout in place.
+            //
+            // A raw commit SHA (see `CHIP_DEFAULT_GITREF`) works here too:
+            // GitHub serves reachable SHAs, so `FETCH_HEAD` becomes that commit
+            // and the `reset --hard` below is a no-op re-pin rather than a
+            // fast-forward. It also makes the fetch necessary rather than merely
+            // an optimisation, since a shallow-ish or stale clone may not have
+            // the object yet.
             let mut fetch = Command::new("git");
             fetch
                 .current_dir(chip_dir)

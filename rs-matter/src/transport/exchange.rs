@@ -26,7 +26,7 @@ use embassy_time::{Duration, Instant, Timer};
 use crate::acl::Accessor;
 use crate::bdx::{self, PROTO_ID_BDX};
 use crate::crypto::Crypto;
-use crate::dm::NodeId;
+use crate::dm::{AuxAclCheck, Metadata, NodeId};
 use crate::error::{Error, ErrorCode};
 use crate::im::{self, PROTO_ID_INTERACTION_MODEL};
 use crate::sc::{self, PROTO_ID_SECURE_CHANNEL};
@@ -249,11 +249,15 @@ impl ExchangeId {
         }
     }
 
-    fn accessor<'a>(&self, matter: &'a Matter<'a>) -> Result<Accessor<'a>, Error> {
+    fn accessor<'a>(
+        &self,
+        matter: &'a Matter<'a>,
+        aux_acl_enabled: bool,
+    ) -> Result<Accessor<'a>, Error> {
         self.with_state(matter, |state| {
             let sess = self.session(&mut state.sessions);
 
-            Ok(Accessor::for_session(sess, matter))
+            Ok(Accessor::for_session(sess, matter, aux_acl_enabled))
         })
     }
 
@@ -587,6 +591,17 @@ impl MessageMeta {
         // Don't create new exchanges for standalone ACKs and for SC status codes
         !self.is_standalone_ack() && !self.is_sc_status()
     }
+
+    /// Whether this message is a *control* message. Control messages
+    /// travel on a separate counter space (the "control message
+    /// counter") and set the `C` bit in the plain-header Security
+    /// Flags. Today only the MCSP opcodes qualify; the transport
+    /// layer flips the `C` bit on the outgoing packet based on this.
+    pub fn is_control_msg(&self) -> bool {
+        self.proto_id == PROTO_ID_SECURE_CHANNEL
+            && (self.proto_opcode == sc::OpCode::MsgCounterSyncReq as u8
+                || self.proto_opcode == sc::OpCode::MsgCounterSyncResp as u8)
+    }
 }
 
 impl Display for MessageMeta {
@@ -708,6 +723,35 @@ impl TxMessage<'_> {
         meta.set_into(&mut self.packet.header.proto);
 
         self.matter.with_state(|state| {
+            // An outgoing group DATA message is stamped with the Global Group
+            // Encrypted Data Message Counter, fetched (and advanced) up-front
+            // since the session borrow below aliases the sessions container.
+            let is_group_data = {
+                let session = state
+                    .sessions
+                    .get(self.exchange_id.session_id())
+                    .ok_or(ErrorCode::NoSession)?;
+
+                matches!(session.get_session_mode(), SessionMode::Group { .. })
+                    && !MessageMeta::from(&self.packet.header.proto).is_control_msg()
+            };
+
+            #[cfg(feature = "groups")]
+            let group_data_ctr = is_group_data
+                .then(|| state.sessions.next_global_group_data_ctr())
+                .transpose()?;
+
+            #[cfg(not(feature = "groups"))]
+            let group_data_ctr = {
+                // Group sessions are never created without the `groups`
+                // feature, so this is unreachable in practice.
+                if is_group_data {
+                    return Err(ErrorCode::InvalidState.into());
+                }
+
+                None
+            };
+
             let session = state
                 .sessions
                 .get(self.exchange_id.session_id())
@@ -722,6 +766,7 @@ impl TxMessage<'_> {
             let (peer, retransmission) = session.pre_send(
                 Some(self.exchange_id.exchange_index()),
                 &mut self.packet.header,
+                group_data_ctr,
                 Some(session.get_peer_active_interval_ms()),
                 Some(session.get_peer_idle_interval_ms()),
             )?;
@@ -1073,6 +1118,13 @@ impl<'a> Exchange<'a> {
     /// Establishing requires a running mDNS responder (e.g.
     /// `BuiltinMdns::run`) to service the resolve; without one the
     /// resolve times out and this returns [`ErrorCode::NotFound`].
+    ///
+    /// With the `case-responder-only` feature the establish path is compiled
+    /// out: only an existing session is reused, and if none exists this returns
+    /// [`ErrorCode::NoSession`] instead of opening a new one. This lets the linker
+    /// drop the CASE initiator and mDNS resolver from a node that never needs to
+    /// initiate CASE (a pure accessory that only reports over sessions its peers
+    /// established).
     #[inline(always)]
     pub async fn initiate<C: Crypto>(
         matter: &'a Matter<'a>,
@@ -1120,11 +1172,49 @@ impl<'a> Exchange<'a> {
 
     /// Create a new initiator exchange on the provided Matter stack for the provided session ID.
     #[inline(always)]
-    pub fn initiate_for_session(matter: &'a Matter<'a>, session_id: u32) -> Result<Self, Error> {
-        matter.transport().initiate_for_session(matter, session_id)
+    pub fn initiate_for_session<C: Crypto>(
+        matter: &'a Matter<'a>,
+        crypto: C,
+        session_id: u32,
+    ) -> Result<Self, Error> {
+        matter
+            .transport()
+            .initiate_for_session(matter, crypto, session_id)
     }
 
-    /// Create a new initiator exchange on a new unsecured (plain-text) session to
+    /// Create a new initiator exchange for sending group DATA messages to
+    /// `(fab_idx, group_id)` — encrypted with the group's active operational
+    /// key and addressed at the group's multicast address.
+    ///
+    /// Group messages are fire-and-forget: no MRP, no acknowledgements and
+    /// no responses — so the exchange is only good for *sending* (e.g. an
+    /// Interaction Model invoke with `SuppressResponse`); do not wait for
+    /// replies on it. The group's security material (a `GroupKeyMap` entry
+    /// plus its key set) must be provisioned on the fabric, else this fails
+    /// with [`ErrorCode::NotFound`].
+    #[cfg(feature = "groups")]
+    pub fn initiate_group<C: Crypto + Copy>(
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fab_idx: NonZeroU8,
+        group_id: u16,
+    ) -> Result<Self, Error> {
+        let session_id = matter.with_state(|state| {
+            let session = state.sessions.get_or_create_for_group_tx(
+                crypto,
+                &state.fabrics,
+                fab_idx,
+                group_id,
+                matter.dev_det(),
+            )?;
+
+            Ok::<_, Error>(session.id)
+        })?;
+
+        Self::initiate_for_session(matter, crypto, session_id)
+    }
+
+    /// Create a new initiator exchange on a new plaintext session to
     /// the given peer address.
     ///
     /// Low-level primitive below the three high-level entry points
@@ -1136,7 +1226,7 @@ impl<'a> Exchange<'a> {
     /// `initiate` (CASE). If there is no space for a new session, an existing
     /// session is evicted and the operation retried.
     #[inline(always)]
-    pub async fn initiate_unsecured<C: Crypto>(
+    pub async fn initiate_plaintext<C: Crypto>(
         matter: &'a Matter<'a>,
         crypto: C,
         peer_addr: network::Address,
@@ -1144,6 +1234,30 @@ impl<'a> Exchange<'a> {
         matter
             .transport
             .initiate_plaintext(matter, crypto, peer_addr)
+            .await
+    }
+
+    /// Open an exchange over a fresh plaintext session to an already-
+    /// commissioned node, resolving its operational address over mDNS.
+    ///
+    /// Like [`initiate_plaintext`](Self::initiate_plaintext) but it discovers the
+    /// peer address itself (as [`initiate`](Self::initiate) does for CASE), rather
+    /// than taking a known one. For sessionless protocols that carry their own
+    /// security and must not establish a CASE session — e.g. sending an ICD
+    /// Check-In message to a registered client.
+    ///
+    /// Requires a running mDNS responder to service the resolve; without one the
+    /// resolve times out and this returns [`ErrorCode::NotFound`].
+    #[inline(always)]
+    pub async fn initiate_plaintext_operational<C: Crypto>(
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+    ) -> Result<Self, Error> {
+        matter
+            .transport
+            .initiate_plaintext_operational(matter, crypto, fabric_idx, peer_node_id)
             .await
     }
 
@@ -1437,8 +1551,11 @@ impl<'a> Exchange<'a> {
         .await
     }
 
-    pub(crate) fn accessor(&self) -> Result<Accessor<'a>, Error> {
-        self.id.accessor(self.matter)
+    pub(crate) fn accessor<M>(&self, metadata: M) -> Result<Accessor<'a>, Error>
+    where
+        M: Metadata,
+    {
+        self.id.accessor(self.matter, metadata.aux_acl_enabled())
     }
 
     pub fn is_groupcast(&self) -> Result<bool, Error> {
@@ -1474,8 +1591,15 @@ impl Drop for Exchange<'_> {
 
             let closed = sess.remove_exch(exch_index);
             if closed {
+                // RX group sessions (unicast peer = the sender's address) are
+                // ephemeral, one per received message — remove them with their
+                // last exchange. TX group sessions (multicast peer) stay: the
+                // just-queued outgoing packet still needs the session for
+                // encoding, and subsequent sends to the same group reuse it
+                // (`get_or_create_for_group_tx`); LRU eviction reclaims them.
                 if matches!(sess.get_session_mode(), SessionMode::Group { .. })
                     && sess.exchanges.iter().all(Option::is_none)
+                    && !sess.is_peer_multicast()
                 {
                     // Group session with no remaining exchanges — remove it
                     state.sessions.remove(self.id.session_id());
@@ -1528,12 +1652,12 @@ mod tests {
     }
 
     #[test]
-    fn test_initiate_unsecured_creates_initiator_exchange() {
+    fn test_initiate_plaintext_creates_initiator_exchange() {
         let matter = test_matter();
         let crypto = test_only_crypto();
         let peer = network::Address::new();
 
-        let exchange = block_on(Exchange::initiate_unsecured(&matter, &crypto, peer)).unwrap();
+        let exchange = block_on(Exchange::initiate_plaintext(&matter, &crypto, peer)).unwrap();
 
         exchange
             .with_state(|state| {
@@ -1551,14 +1675,14 @@ mod tests {
     }
 
     #[test]
-    fn test_initiate_unsecured_retries_after_eviction() {
+    fn test_initiate_plaintext_retries_after_eviction() {
         let matter = test_matter();
         let crypto = test_only_crypto();
         let peer = network::Address::new();
 
         fill_sessions(&matter, false);
 
-        let exchange = block_on(Exchange::initiate_unsecured(&matter, &crypto, peer)).unwrap();
+        let exchange = block_on(Exchange::initiate_plaintext(&matter, &crypto, peer)).unwrap();
 
         exchange
             .with_state(|state| {
@@ -1576,14 +1700,14 @@ mod tests {
     }
 
     #[test]
-    fn test_initiate_unsecured_fails_when_no_session_can_be_evicted() {
+    fn test_initiate_plaintext_fails_when_no_session_can_be_evicted() {
         let matter = test_matter();
         let crypto = test_only_crypto();
         let peer = network::Address::new();
 
         fill_sessions(&matter, true);
 
-        let result = block_on(Exchange::initiate_unsecured(&matter, &crypto, peer));
+        let result = block_on(Exchange::initiate_plaintext(&matter, &crypto, peer));
 
         match result {
             Err(err) => assert!(matches!(err.code(), ErrorCode::NoSpaceSessions)),

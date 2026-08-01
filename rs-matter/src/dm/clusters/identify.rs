@@ -43,10 +43,7 @@ use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 
 use crate::dm::types::EndptId;
-use crate::dm::{
-    Cluster, Dataver, Handler, HandlerContext, InvokeContext, InvokeReply, MatchContext,
-    NonBlockingHandler, ReadContext, ReadReply, WriteContext,
-};
+use crate::dm::{Cluster, Dataver, HandlerContext, InvokeContext, ReadContext, WriteContext};
 use crate::error::Error;
 use crate::utils::sync::blocking::Mutex;
 use crate::utils::sync::Notification;
@@ -130,6 +127,27 @@ impl IdentifyHooks for () {
     }
 }
 
+/// Read-only view over an endpoint's identification state, for sibling
+/// clusters whose behavior depends on it — notably the Groups cluster,
+/// whose `AddGroupIfIdentifying` command only takes effect while the
+/// endpoint is identifying (App Cluster spec).
+///
+/// Implemented by [`IdentifyHandler`]; couple it to the sibling handler
+/// serving the *same* endpoint (identification state is per-endpoint).
+pub trait IdentifyStatus {
+    /// Whether the endpoint is currently identifying (`IdentifyTime > 0`).
+    fn is_identifying(&self) -> bool;
+}
+
+impl<T> IdentifyStatus for &T
+where
+    T: IdentifyStatus + ?Sized,
+{
+    fn is_identifying(&self) -> bool {
+        (*self).is_identifying()
+    }
+}
+
 /// The captured identify session. Reads of `IdentifyTime` compute
 /// `duration.saturating_sub(elapsed)` from this on-demand; the run task
 /// uses `endpoint_id` to target its `notify_attr_changed` at the right
@@ -183,14 +201,11 @@ struct Session {
 /// signals attribute-changed notifications, and the framework takes care
 /// of dataver progression.
 ///
-/// # Why this implements `Handler` directly
-///
-/// The cluster's request dispatch (read / write / invoke) is delegated to
-/// the generated `HandlerAdaptor` — see the `Handler` impl below — which
-/// keeps the read/write/invoke surface as cheap sync calls (smaller
-/// footprint than `ClusterAsyncHandler`'s all-async state machines). The
-/// only async surface this handler exposes is the deadline-timer task in
-/// `Handler::run`, which is exactly what we need.
+/// The handler implements the (sync) `ClusterHandler` trait — which keeps
+/// the read/write/invoke surface as cheap sync calls (smaller footprint
+/// than `ClusterAsyncHandler`'s all-async state machines) — and provides
+/// the deadline-timer task via `ClusterHandler::run`. Adapt it to the
+/// generic `rs-matter` `Handler` trait with [`IdentifyHandler::adapt`].
 pub struct IdentifyHandler<H = ()> {
     dataver: Dataver,
     /// `Some(session)` while identifying, `None` when idle. Reads of
@@ -246,6 +261,11 @@ where
         (duration as u64).saturating_sub(elapsed) as u16
     }
 
+    /// Adapt the handler instance to the generic `rs-matter` `Handler` trait.
+    pub const fn adapt(self) -> HandlerAdaptor<Self> {
+        HandlerAdaptor(self)
+    }
+
     /// Capture a new identify session (or clear the existing one),
     /// dispatch the matching [`IdentifyAction`] to the hooks, and wake the
     /// run loop so it can re-arm its deadline timer. Caller is responsible
@@ -270,6 +290,15 @@ where
         } else {
             IdentifyAction::Time(value)
         });
+    }
+}
+
+impl<H> IdentifyStatus for IdentifyHandler<H>
+where
+    H: IdentifyHooks,
+{
+    fn is_identifying(&self) -> bool {
+        self.remaining() > 0
     }
 }
 
@@ -337,32 +366,6 @@ where
         self.hooks.identify(IdentifyAction::Effect(effect, variant));
         Ok(())
     }
-}
-
-// Implement `Handler` directly so we get to provide the `run` deadline
-// task, while still delegating the read/write/invoke/bump_dataver dispatch
-// to the generated `HandlerAdaptor` (which is parameterized over a
-// `ClusterHandler` impl, which we provide above). The `&Self: ClusterHandler`
-// blanket — generated alongside the trait — makes this delegation cheap.
-impl<H> Handler for IdentifyHandler<H>
-where
-    H: IdentifyHooks,
-{
-    fn read(&self, ctx: impl ReadContext, reply: impl ReadReply) -> Result<(), Error> {
-        Handler::read(&HandlerAdaptor(self), ctx, reply)
-    }
-
-    fn write(&self, ctx: impl WriteContext) -> Result<(), Error> {
-        Handler::write(&HandlerAdaptor(self), ctx)
-    }
-
-    fn invoke(&self, ctx: impl InvokeContext, reply: impl InvokeReply) -> Result<(), Error> {
-        Handler::invoke(&HandlerAdaptor(self), ctx, reply)
-    }
-
-    fn bump_dataver(&self, ctx: impl MatchContext) {
-        Handler::bump_dataver(&HandlerAdaptor(self), ctx)
-    }
 
     async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
         loop {
@@ -407,9 +410,3 @@ where
         }
     }
 }
-
-// Marker impl: the `Handler::read`/`write`/`invoke` methods above are
-// fully synchronous, which lets the chain compose this handler with the
-// `Async(...)` lifter (defined in `dm::types::handler`) into the rest of
-// the cluster chain just like the sync `HandlerAdaptor`-based clusters.
-impl<H> NonBlockingHandler for IdentifyHandler<H> where H: IdentifyHooks {}

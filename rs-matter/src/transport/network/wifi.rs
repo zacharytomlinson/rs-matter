@@ -1,6 +1,6 @@
 /*
  *
- *    Copyright (c) 2022-2025 Project CHIP Authors
+ *    Copyright (c) 2022-2026 Project CHIP Authors
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
  *    limitations under the License.
  */
 
-pub mod band;
 #[cfg(feature = "zbus")]
 pub mod nm;
 #[cfg(feature = "zbus")]

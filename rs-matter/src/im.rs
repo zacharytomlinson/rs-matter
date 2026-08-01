@@ -24,7 +24,10 @@
 //! responder - [`busy`] - which always returns a busy status code to all
 //! incoming IM requests.
 
+use core::cell::Cell;
 use core::num::NonZeroU8;
+
+use crate::utils::sync::blocking::Mutex;
 use core::pin::pin;
 
 use embassy_futures::select::{select3, select4};
@@ -33,7 +36,7 @@ use embassy_time::{Instant, Timer};
 use crate::acl::Accessor;
 use crate::crypto::Crypto;
 use crate::dm::clusters::net_comm::{
-    NetCtl, NetworkType, Networks, NetworksAccess, SharedNetworks,
+    NetCtl, NetCtlStatus, NetworkType, Networks, NetworksAccess, SharedNetworks,
 };
 use crate::dm::clusters::wifi_diag::WirelessDiag;
 use crate::dm::networks::eth::EthNetwork;
@@ -41,7 +44,7 @@ use crate::dm::networks::wireless::{NoopWirelessNetCtl, WirelessMgr, MAX_CREDS_S
 use crate::dm::networks::NetChangeNotif;
 use crate::dm::{
     AsyncHandler, AttrChangeNotifier, AttrDetails, Attribute, DataModel, EventEmitter,
-    HandlerContext, MatchContextInstance, Metadata,
+    HandlerContext, LifecycleOp, MatchContextInstance, Metadata, ReportDataHandler,
 };
 use crate::error::{Error, ErrorCode};
 use crate::im::events::{EventReader, EventTLVWrite, Events, DEFAULT_MAX_EVENTS_BUF_SIZE};
@@ -70,6 +73,45 @@ pub mod expand;
 pub mod invoker;
 pub mod subscriptions;
 
+/// Resource-utilisation metrics for the node, as reported by
+/// `GeneralDiagnostics::DeviceLoadStatus`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DeviceLoad {
+    /// Subscriptions currently established on the node, across all fabrics.
+    pub current_subscriptions: u16,
+    /// Subscriptions currently established on the fabric of the reading
+    /// subject. Zero when the figures were gathered without a fabric in scope.
+    pub current_subscriptions_for_fabric: u16,
+    /// Subscriptions accepted since boot, including those since torn down.
+    pub total_subscriptions_established: u32,
+    /// Interaction Model messages sent since boot.
+    pub total_im_messages_sent: u32,
+    /// Interaction Model messages received since boot.
+    pub total_im_messages_received: u32,
+}
+
+/// Interaction-Model state threaded down to cluster handlers via
+/// [`HandlerContext::im_stats`](crate::dm::HandlerContext::im_stats).
+///
+pub trait ImStats {
+    /// The node's resource-utilisation metrics, for
+    /// `GeneralDiagnostics::DeviceLoadStatus`.
+    ///
+    /// `fab_idx` is the fabric of the reading subject, for
+    /// `CurrentSubscriptionsForFabric`; pass `None` when no fabric is in scope.
+    fn device_load(&self, fab_idx: Option<NonZeroU8>) -> DeviceLoad;
+}
+
+impl<T> ImStats for &T
+where
+    T: ImStats,
+{
+    fn device_load(&self, fab_idx: Option<NonZeroU8>) -> DeviceLoad {
+        (**self).device_load(fab_idx)
+    }
+}
+
 /// An `ExchangeHandler` implementation capable of handling responder exchanges for the Interaction Model protocol.
 /// The mutable, owned-together state a [`InteractionModel`] operates on: the
 /// subscriptions table, the events queue and the network store.
@@ -95,6 +137,7 @@ pub struct InteractionModelState<
     subscriptions: Subscriptions<NS>,
     events: Events<NE>,
     networks: SharedNetworks<N>,
+    start_up_emitted: Mutex<Cell<bool>>,
 }
 
 impl<N, const NS: usize, const NE: usize> InteractionModelState<N, NS, NE> {
@@ -104,6 +147,7 @@ impl<N, const NS: usize, const NE: usize> InteractionModelState<N, NS, NE> {
             subscriptions: Subscriptions::new(),
             events: Events::new(),
             networks: SharedNetworks::new(networks),
+            start_up_emitted: Mutex::new(Cell::new(false)),
         }
     }
 
@@ -114,34 +158,43 @@ impl<N, const NS: usize, const NE: usize> InteractionModelState<N, NS, NE> {
             subscriptions <- Subscriptions::init(),
             events <- Events::init(),
             networks <- SharedNetworks::init(networks),
+            start_up_emitted: Mutex::new(Cell::new(false)),
         })
     }
 
+    /// Suppress the `BasicInformation::StartUp` event that
+    /// [`InteractionModel::run`] would otherwise emit when it first starts.
+    ///
+    /// Call before `run` when starting the stack does *not* correspond to a
+    /// device boot - e.g. a warm restart of the Matter stack within a running
+    /// process, or a test fixture that needs a deterministic events queue.
+    pub fn suppress_start_up_event(&self) {
+        self.start_up_emitted.lock(|flag| flag.set(true));
+    }
+
     /// Reset this state's persisted contents to factory defaults - the
-    /// events-queue epoch and the network store - removing both from `kv` using
-    /// the scratch buffer provided by `kv`. Call once during a factory reset,
-    /// with exclusive (`&mut`) access (i.e. before the state is shared with a
-    /// [`InteractionModel`]).
-    pub async fn reset_persist<K>(&mut self, kv: K) -> Result<(), Error>
+    /// events-queue epoch, the network store and (if compiled in) the persisted
+    /// subscriptions - removing them from `kv` using the scratch buffer
+    /// provided by `kv`.
+    ///
+    /// Driven by [`InteractionModel::factory_reset`].
+    fn reset_persist<K>(&self, kv: K) -> Result<(), Error>
     where
         K: KvBlobStoreAccess,
         N: Networks,
     {
-        // We hold `&mut self`, so borrow the pieces directly - no locking.
-        let Self {
-            events, networks, ..
-        } = self;
-
-        let events = events.inner_mut();
-        let networks = networks.get_mut().get_mut();
-
+        // The KV ops are sync, so do them all inside a single `access` closure.
         kv.access(|store, buf| {
             // The event-number epoch.
-            events.reset_persist(&mut *store, buf)?;
+            self.events.reset_persist(&mut *store, buf)?;
 
             // The network store.
-            networks.reset()?;
+            self.networks.with_raw(|networks| networks.reset())?;
             store.remove(NETWORKS_KEY, buf)?;
+
+            // Every persisted subscription record.
+            #[cfg(feature = "persistent-subscriptions")]
+            self.subscriptions.reset_persist(&mut *store, buf)?;
 
             Ok(())
         })
@@ -149,34 +202,28 @@ impl<N, const NS: usize, const NE: usize> InteractionModelState<N, NS, NE> {
 
     /// Re-hydrate this state's persisted contents - the events-queue epoch (so
     /// event numbers are not reused across reboots) and the network store - using
-    /// the scratch buffer provided by `kv`. Call once at startup, before the
-    /// state is shared with a [`InteractionModel`].
-    pub async fn load_persist<K>(&mut self, kv: K) -> Result<(), Error>
+    /// the scratch buffer provided by `kv`.
+    ///
+    /// Driven by [`InteractionModel::startup`].
+    fn load_persist<K>(&self, kv: K) -> Result<(), Error>
     where
         K: KvBlobStoreAccess,
         N: Networks,
     {
-        // We hold `&mut self`, so borrow the pieces directly - no locking
-        // (the inner mutexes are only needed for shared, runtime access).
-        let Self {
-            events, networks, ..
-        } = self;
-
-        let events = events.inner_mut();
-        let networks = networks.get_mut().get_mut();
-
         // The KV ops are sync, so do them all inside a single `access` closure.
         kv.access(|store, buf| {
             // The event-number epoch.
-            events.load_persist(&mut *store, buf)?;
+            self.events.load_persist(&mut *store, buf)?;
 
             // The network store.
-            networks.reset()?;
-            if let Some(data) = store.load(NETWORKS_KEY, buf)? {
-                networks.load(data)?;
-            }
+            self.networks.with_raw(|networks| {
+                networks.reset()?;
+                if let Some(data) = store.load(NETWORKS_KEY, buf)? {
+                    networks.load(data)?;
+                }
 
-            Ok(())
+                Ok(())
+            })
         })
     }
 
@@ -211,6 +258,7 @@ pub struct InteractionModel<
     K,
     N,
     NC = NoopWirelessNetCtl,
+    R = (),
     const NS: usize = DEFAULT_MAX_SUBSCRIPTIONS,
     const NE: usize = DEFAULT_MAX_EVENTS_BUF_SIZE,
 > where
@@ -224,6 +272,10 @@ pub struct InteractionModel<
     subscriptions_buffers: SubscriptionsBuffers<'a, B, NS>,
     state: &'a InteractionModelState<N, NS, NE>,
     handler: T,
+    /// The controller-side `ReportData` consumer. Defaults to `()`, which
+    /// disowns every inbound report (the accessory role). A controller injects a
+    /// real one via [`InteractionModel::new_with_reports`].
+    report_handler: R,
 }
 
 /// A [`InteractionModelState`] for an Ethernet device: its network store is a fixed
@@ -243,9 +295,10 @@ pub type EthInteractionModel<
     T,
     K,
     NC = NoopWirelessNetCtl,
+    R = (),
     const NS: usize = DEFAULT_MAX_SUBSCRIPTIONS,
     const NE: usize = DEFAULT_MAX_EVENTS_BUF_SIZE,
-> = InteractionModel<'a, C, B, T, K, EthNetwork<'static>, NC, NS, NE>;
+> = InteractionModel<'a, C, B, T, K, EthNetwork<'static>, NC, R, NS, NE>;
 
 /// A [`InteractionModelState`] for a wireless device, parameterized by the concrete
 /// wireless network store `N` (e.g. `WifiNetworks<3>` or a Thread store). Pairs
@@ -266,12 +319,13 @@ pub type WirelessInteractionModel<
     K,
     N,
     NC,
+    R = (),
     const NS: usize = DEFAULT_MAX_SUBSCRIPTIONS,
     const NE: usize = DEFAULT_MAX_EVENTS_BUF_SIZE,
-> = InteractionModel<'a, C, B, T, K, N, NC, NS, NE>;
+> = InteractionModel<'a, C, B, T, K, N, NC, R, NS, NE>;
 
 impl<'a, C, B, T, K, N, const NS: usize, const NE: usize>
-    InteractionModel<'a, C, B, T, K, N, NoopWirelessNetCtl, NS, NE>
+    InteractionModel<'a, C, B, T, K, N, NoopWirelessNetCtl, (), NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -319,7 +373,7 @@ where
 }
 
 impl<'a, C, B, T, K, N, NC, const NS: usize, const NE: usize>
-    InteractionModel<'a, C, B, T, K, N, NC, NS, NE>
+    InteractionModel<'a, C, B, T, K, N, NC, (), NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -368,6 +422,59 @@ where
             subscriptions_buffers: SubscriptionsBuffers::new(),
             state,
             handler,
+            report_handler: (),
+        }
+    }
+}
+
+impl<'a, C, B, T, K, N, NC, R, const NS: usize, const NE: usize>
+    InteractionModel<'a, C, B, T, K, N, NC, R, NS, NE>
+where
+    C: Crypto,
+    B: Buffers<IMBuffer>,
+    T: DataModel,
+    K: KvBlobStoreAccess,
+    N: Networks,
+    R: ReportDataHandler,
+{
+    /// Create the data model with an explicit network controller `net_ctl` and a
+    /// [`ReportDataHandler`] `report_handler` — the controller / subscriber role.
+    ///
+    /// This is [`InteractionModel::new_with_net_ctl`] plus a report consumer:
+    /// after this node establishes subscriptions (via the IM client), the
+    /// publishers push `ReportData` on fresh inbound exchanges, which the
+    /// `InteractionModel` routes to `report_handler`. The default
+    /// (`new`/`new_with_net_ctl`) constructors leave the report handler as `()`,
+    /// which disowns every report — correct for a pure accessory.
+    ///
+    /// # Arguments
+    /// Same as [`InteractionModel::new_with_net_ctl`], plus:
+    /// - `report_handler` - an instance of type `R` implementing
+    ///   [`ReportDataHandler`], invoked once per received `ReportData` chunk.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_reports(
+        matter: &'a Matter<'a>,
+        crypto: C,
+        buffers: &'a B,
+        handler: T,
+        kv: K,
+        net_ctl: NC,
+        report_handler: R,
+        state: &'a InteractionModelState<N, NS, NE>,
+    ) -> Self {
+        state.subscriptions.clear();
+
+        Self {
+            matter,
+            crypto,
+            buffers,
+            kv,
+            net_ctl,
+            subscriptions_buffers: SubscriptionsBuffers::new(),
+            state,
+            handler,
+            report_handler,
         }
     }
 
@@ -432,16 +539,90 @@ where
         self.matter.bump_configuration_version(&self.kv, self)
     }
 
+    /// Bring the Data Model to its operational state after a reboot.
+    ///
+    /// Call once, after constructing the `InteractionModel` and before running
+    /// it or serving exchanges. In order:
+    /// - Re-hydrates the [`InteractionModelState`] - the events-queue epoch (so
+    ///   event numbers are not reused across reboots) and the network store;
+    /// - Replays any persisted subscriptions into the reporter's table (if the
+    ///   `persistent-subscriptions` feature is enabled), so a subscriber that
+    ///   had a subscription before this reboot keeps receiving reports instead
+    ///   of having to notice the loss and re-subscribe;
+    /// - Broadcasts [`LifecycleOp::Startup`] to every cluster handler in the
+    ///   data model, so handlers with a persistence story of their own (which
+    ///   the Interaction Model otherwise treats as opaque) can re-hydrate their
+    ///   state from [`HandlerContext::kv`].
+    ///
+    /// The `Matter`-level counterpart is [`Matter::startup`] - call that one
+    /// first.
+    pub async fn startup(&self) -> Result<(), Error> {
+        self.state.load_persist(&self.kv)?;
+
+        // Needs the events watermark loaded just above.
+        self.resume_subscriptions()?;
+
+        self.handler.lifecycle(self, LifecycleOp::Startup)
+    }
+
+    /// Factory-reset the Data Model persistable state.
+    ///
+    /// The counterpart of [`InteractionModel::startup`]. In order:
+    /// - Resets the [`InteractionModelState`] persisted contents to factory
+    ///   defaults - the events-queue epoch, the network store and (if compiled
+    ///   in) the persisted subscriptions - removing them from the KV store;
+    /// - Broadcasts [`LifecycleOp::FactoryReset`] to every cluster handler in
+    ///   the data model, so handlers can reset their own state and remove their
+    ///   persisted data from [`HandlerContext::kv`].
+    ///
+    /// Call when the node is factory-reset, alongside the `Matter`-level
+    /// counterpart, [`Matter::factory_reset`].
+    pub async fn factory_reset(&self) -> Result<(), Error> {
+        self.state.reset_persist(&self.kv)?;
+
+        self.handler.lifecycle(self, LifecycleOp::FactoryReset)
+    }
+
     /// Run the Data Model instance.
     ///
     /// This drives the IM timeout checks, the data-model handler's own background
     /// job, the subscriptions reporting loop, and - for wireless devices - the
     /// operational connection manager (inert for Ethernet, where `net_ctl` is a
     /// [`NoopWirelessNetCtl`]).
+    /// Emit the `BasicInformation::StartUp` event, once per process lifetime.
+    ///
+    /// Matter Core spec: the node emits `StartUp` "upon completion of a boot
+    /// or reboot process"; the closest stack-observable moment is the start of
+    /// [`Self::run`], i.e. when the node becomes operational. The stack owns
+    /// this (rather than a public emit API the application must remember to
+    /// call) so every device is conformant by default. Event numbers stay
+    /// monotonic across reboots via the events store's epoch persistence, so
+    /// each boot's `StartUp` is a fresh, correctly-numbered event.
+    ///
+    /// Failure to emit (e.g. events buffer exhaustion) is logged, not fatal:
+    /// a missing diagnostic event must not take the node down.
+    fn emit_start_up_once(&self) {
+        let emit = self.state.start_up_emitted.lock(|flag| !flag.replace(true));
+
+        if emit {
+            let result = crate::dm::clusters::decl::basic_information::StartUp::emit_for(
+                self,
+                crate::dm::endpoints::ROOT_ENDPOINT_ID,
+                |event| event.software_version(self.matter.dev_det().sw_ver)?.end(),
+            );
+
+            if let Err(e) = result {
+                warn!("Failed to emit the StartUp event: {:?}", e);
+            }
+        }
+    }
+
     pub async fn run(&self) -> Result<(), Error>
     where
-        NC: NetCtl + WirelessDiag + NetChangeNotif,
+        NC: NetCtl + NetCtlStatus + WirelessDiag + NetChangeNotif,
     {
+        self.emit_start_up_once();
+
         let mut timeouts = pin!(self.run_timeout_checks());
         let mut handler = pin!(self.handler.run(self));
         let mut subs = pin!(self.process_subscriptions(self.matter));
@@ -460,7 +641,7 @@ where
     /// the registered networks and (re)connecting as needed once commissioned.
     async fn run_net_mgr(&self) -> Result<(), Error>
     where
-        NC: NetCtl + WirelessDiag + NetChangeNotif,
+        NC: NetCtl + NetCtlStatus + WirelessDiag + NetChangeNotif,
     {
         if self.net_ctl.net_type() == NetworkType::Ethernet {
             // Nothing to manage for a wired device - just pend forever.
@@ -485,7 +666,7 @@ where
     /// to own a `WirelessMgr` (or the networks) itself.
     pub async fn connect_once(&self, network_id: &[u8]) -> Result<(), Error>
     where
-        NC: NetCtl + WirelessDiag + NetChangeNotif,
+        NC: NetCtl + NetCtlStatus + WirelessDiag + NetChangeNotif,
     {
         let mut buf = [0u8; MAX_CREDS_SIZE];
         let mut mgr = WirelessMgr::new(self.state.networks(), &self.net_ctl, &mut buf);
@@ -508,7 +689,7 @@ where
         let mut notify_change =
             |endpt_id, clust_id| self.notify_cluster_changed(endpt_id, clust_id);
 
-        self.matter.with_state(|state| {
+        let removed_fabric = self.matter.with_state(|state| {
             let expire_sess_id = exch_id.and_then(|exch_id| {
                 state
                     .sessions
@@ -517,7 +698,7 @@ where
             });
 
             // Disarm the failsafe on timeout
-            state.failsafe.check_failsafe_timeout(
+            let removed_fabric = state.failsafe.check_failsafe_timeout(
                 &mut state.fabrics,
                 &mut state.sessions,
                 &self.state.networks,
@@ -532,8 +713,16 @@ where
                 .pase
                 .check_comm_window_timeout(&mut notify_mdns, &mut notify_change)?;
 
-            Ok(())
-        })
+            Ok::<_, Error>(removed_fabric)
+        })?;
+
+        // Outside `with_state`, since the broadcast runs the handlers inline
+        // and they are free to access the Matter state themselves
+        if let Some(fab_idx) = removed_fabric {
+            self.notify_fabric_removed(fab_idx);
+        }
+
+        Ok(())
     }
 
     /// Answer a responding exchange using the `DataModel` instance wrapped by this exchange handler.
@@ -582,6 +771,10 @@ where
                 error!("Received a groupcast message for opcode: SubscribeRequest")
             }
             OpCode::SubscribeRequest if !is_groupcast => self.subscribe(exchange).await?,
+            OpCode::ReportData if is_groupcast => {
+                error!("Received a groupcast message for opcode: ReportData")
+            }
+            OpCode::ReportData if !is_groupcast => self.handle_report_data(exchange).await?,
             OpCode::TimedRequest if !is_groupcast => {
                 Self::send_status(exchange, IMStatusCode::InvalidAction).await?
             }
@@ -786,7 +979,7 @@ where
         let req = SubscribeReq::new(TLVElement::new(&rx));
         debug!("IM: Subscribe request: {:?}", req);
 
-        let accessor = exchange.accessor()?;
+        let accessor = exchange.accessor(&self.handler)?;
 
         if let Err(err) = self.validate_subscribe(&req, &accessor) {
             error!("Invalid subscribe request: {:?}", err);
@@ -820,7 +1013,6 @@ where
             now,
             fab_idx,
             peer_node_id,
-            exchange.id().session_id(),
             min_int_secs,
             max_int_secs,
             self.state.events.watermark(),
@@ -848,7 +1040,100 @@ where
             // runs on `Drop`) and then wake the reporter so it can account for
             // the new subscription's deadline.
             drop(rctx);
+
+            // Persist the (now-committed) table so this subscription can be
+            // resumed across a reboot.
+            self.persist_subscriptions();
+
             self.state.subscriptions.notification.notify();
+        }
+
+        Ok(())
+    }
+
+    /// Handle a server-initiated `ReportData` message — the controller /
+    /// subscriber side of a subscription.
+    ///
+    /// After a controller establishes a subscription (via the IM client), the
+    /// publisher pushes `ReportData` messages on fresh inbound exchanges for the
+    /// life of the subscription. Those exchanges land here (the `InteractionModel`
+    /// owns all inbound IM traffic); we parse each chunk, hand it to the
+    /// `DataModel`'s [`ReportDataHandler`](crate::dm::ReportDataHandler) side, and
+    /// reply `StatusResponse` — `Success` when the handler accepts, or the
+    /// handler's chosen status (e.g. `InvalidSubscription`) when it disowns the
+    /// report. A pure accessory's handler always disowns reports, so this is inert
+    /// for the accessory role.
+    ///
+    /// Mirrors the priming-chunk loop the IM client walks during subscribe
+    /// establishment: for each chunk we ack with `StatusResponse(Success)` and
+    /// fetch the next until `more_chunks` clears. The terminal MRP ack is left to
+    /// the caller's `exchange.acknowledge()` (idempotent after our `send_status`).
+    async fn handle_report_data(&self, exchange: &mut Exchange<'_>) -> Result<(), Error> {
+        // The peer identity is a property of the (secure) session, constant
+        // across every chunk of this report.
+        let (fabric_idx, peer_node_id) = exchange.with_state(|state| {
+            let sess = exchange.id().session(&mut state.sessions);
+
+            let fabric_idx =
+                NonZeroU8::new(sess.get_local_fabric_idx()).ok_or(ErrorCode::Invalid)?;
+            let peer_node_id = sess.get_peer_node_id().ok_or(ErrorCode::Invalid)?;
+
+            Ok((fabric_idx, peer_node_id))
+        })?;
+
+        loop {
+            let (result, more_chunks, suppress_response) = {
+                let rx = exchange.rx()?;
+                let report = ReportDataResp::from_tlv(&TLVElement::new(rx.payload()))?;
+
+                let subscription = crate::dm::SubscriptionCtx {
+                    fabric_idx,
+                    peer_node_id,
+                    subscription_id: report.subscription_id,
+                };
+
+                // The report context is a `HandlerContext` (matter/crypto/kv/…)
+                // over a shared borrow of the exchange, valid only for the
+                // duration of this handler call — after which we resume the
+                // mutable ack/fetch loop below.
+                let ctx = crate::dm::ReportContextInstance::new(&*exchange, self, subscription);
+
+                let result = self.report_handler.handle_report(ctx, &report).await;
+
+                (
+                    result,
+                    report.more_chunks.unwrap_or(false),
+                    report.suppress_response.unwrap_or(false),
+                )
+            };
+
+            // Spec forbids `suppress_response=true` alongside `more_chunks=true`.
+            if more_chunks && suppress_response {
+                return Self::send_status(exchange, IMStatusCode::InvalidAction).await;
+            }
+
+            // A non-Success handler result disowns the (sub)report; report the
+            // status and stop — no point ack-ing further chunks of a report we
+            // rejected.
+            //
+            // `SuppressResponse` only suppresses the *Success* StatusResponse: a
+            // failure status MUST always be sent (Matter Core spec), so the
+            // publisher can tear down a subscription we no longer track (e.g. our
+            // `InvalidSubscription`). Sending it regardless of `suppress_response`.
+            if let Err(status) = result {
+                return Self::send_status(exchange, status).await;
+            }
+
+            if !suppress_response {
+                Self::send_status(exchange, IMStatusCode::Success).await?;
+            }
+
+            if !more_chunks {
+                break;
+            }
+
+            // Next chunk rides in on the same exchange.
+            exchange.recv_fetch().await?;
         }
 
         Ok(())
@@ -909,6 +1194,74 @@ where
         })
     }
 
+    /// Persist the current subscription table to `kv`, one record per key.
+    ///
+    /// A no-op when the store is a dummy (no scratch buffer). Best-effort: a
+    /// persistence failure is logged but never propagated, so it cannot break
+    /// reporting — persisting subscriptions is spec-optional.
+    ///
+    /// Compiled to a no-op unless the `persistent-subscriptions` feature is
+    /// enabled, so the whole persistence path (TLV serialization, the key-value
+    /// store writes) is dropped from a device that does not want it.
+    #[cfg(feature = "persistent-subscriptions")]
+    fn persist_subscriptions(&self) {
+        let result = self.kv.access(|store, buf| {
+            self.state
+                .subscriptions
+                .persist_all(&self.subscriptions_buffers, store, buf)
+        });
+
+        if let Err(e) = result {
+            warn!("Failed to persist subscriptions: {:?}", e);
+        }
+    }
+
+    #[cfg(not(feature = "persistent-subscriptions"))]
+    #[inline(always)]
+    fn persist_subscriptions(&self) {}
+
+    /// Re-hydrate the subscription table from `kv` and re-arm the reporter.
+    ///
+    /// Driven by [`InteractionModel::startup`], after the events state has been
+    /// loaded (the replayed subscriptions are primed against the loaded events
+    /// watermark). Each persisted subscription is replayed into the table as a
+    /// live (already primed) subscription; the reporter then reaches the
+    /// subscriber on demand by establishing a session when the next report is
+    /// due. No session is opened proactively here.
+    ///
+    /// Compiled to a no-op (returning `Ok`) unless the `persistent-subscriptions`
+    /// feature is enabled.
+    #[cfg(feature = "persistent-subscriptions")]
+    fn resume_subscriptions(&self) -> Result<(), Error> {
+        let now = Instant::now();
+        let watermark = self.state.events.watermark();
+
+        self.kv.access(|store, buf| {
+            self.state.subscriptions.load_persist(
+                self.buffers,
+                &self.subscriptions_buffers,
+                store,
+                buf,
+                now,
+                watermark,
+            )
+        })?;
+
+        // Wake the reporter so it accounts for the resumed subscriptions'
+        // liveness deadlines.
+        self.state.subscriptions.notification.notify();
+
+        Ok(())
+    }
+
+    /// See the `persistent-subscriptions` variant above; a no-op when that
+    /// feature is off.
+    #[cfg(not(feature = "persistent-subscriptions"))]
+    #[inline(always)]
+    fn resume_subscriptions(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Process all valid subscriptions in an endless loop, checking for changes
     /// and reporting them to the peers.
     async fn process_subscriptions(&self, matter: &Matter<'_>) -> Result<(), Error> {
@@ -937,44 +1290,58 @@ where
 
             // First remove all expired or no-longer valid subscriptions
 
+            let mut removed_any = false;
             loop {
-                let removed_any =
-                    self.state
-                        .subscriptions
-                        .remove(&self.subscriptions_buffers, |sub| {
-                            if sub.is_expired(now) {
-                                return Some("expired");
+                let removed = self
+                    .state
+                    .subscriptions
+                    .remove(&self.subscriptions_buffers, |sub| {
+                        if sub.is_expired(now) {
+                            return Some("expired");
+                        }
+
+                        matter.with_state(|state| {
+                            if state.fabrics.get(sub.ids().fab_idx).is_none() {
+                                return Some("fabric removed");
                             }
 
-                            matter.with_state(|state| {
-                                if state.fabrics.get(sub.ids().fab_idx).is_none() {
-                                    return Some("fabric removed");
-                                }
+                            // A subscription is NOT dropped merely because the
+                            // session it was accepted on is gone (eviction,
+                            // peer-side re-handshake, unreachable peer, a received
+                            // Close, ...): reports route by `(fabric, node)` and a
+                            // fresh session is established on demand. A session
+                            // ending is a transport event, not a subscription
+                            // teardown. It ends only through its own lifecycle —
+                            // `max_int` liveness timeout (handled above as
+                            // "expired"), or the subscriber answering a report with
+                            // a non-success status (handled in the report loop, which
+                            // then purges the persisted record).
+                            None
+                        })
+                    });
 
-                                // The session the subscription was accepted on was
-                                // torn down (eviction, explicit close, peer-side
-                                // CASE re-handshake, ...). Per Matter spec
-                                // subscriptions are scoped to the session they
-                                // were established on, and the publisher can no
-                                // longer route reports to the subscriber. Drop
-                                // immediately rather than waiting for `max_int`
-                                // to expire and time-out the send.
-                                if state.sessions.get(sub.session_id()).is_none() {
-                                    return Some("session removed");
-                                }
+                removed_any |= removed;
 
-                                None
-                            })
-                        });
-
-                if !removed_any {
+                if !removed {
                     break;
                 }
+            }
+
+            // Keep the persisted set an exact mirror of the (now-smaller) table:
+            // any dropped subscription's record is removed so it will not be
+            // resumed on the next reboot.
+            if removed_any {
+                self.persist_subscriptions();
             }
 
             // Now report while there are subscriptions which are due for reporting
 
             let event_numbers_watermark = self.state.events.watermark();
+
+            // Track whether any subscription left the table during reporting (the
+            // subscriber answered a report with a non-success status, i.e. a
+            // deliberate unsubscribe), so its persisted record can be purged.
+            let mut dropped_any = false;
 
             loop {
                 let Some(mut rctx) = self.state.subscriptions.report(
@@ -989,13 +1356,51 @@ where
 
                 match result {
                     Ok(true) => rctx.set_keep(),
-                    Ok(false) => (),
-                    Err(e) => error!(
-                        "Error processing subscription {:?}: {:?}",
-                        rctx.subscription().ids(),
-                        e
-                    ),
+                    // Not kept: the subscriber tore the subscription down (or we
+                    // could not report). Dropping it from the table on `rctx`
+                    // drop means its persisted record must be purged too.
+                    Ok(false) => dropped_any = true,
+                    Err(e) => {
+                        // Reporting failed — typically because the session to the
+                        // subscriber died (peer unreachable, MRP retransmissions
+                        // exhausted). Drop that session so the next report to this
+                        // peer establishes a fresh one, and keep the subscription
+                        // so it retries rather than being torn down.
+                        let (fab_idx, peer_node_id) = {
+                            let ids = rctx.subscription().ids();
+                            (ids.fab_idx, ids.peer_node_id)
+                        };
+
+                        warn!(
+                            "Error processing subscription (fab {}, node {:x}): {:?}; dropping its session, will retry",
+                            fab_idx.get(),
+                            peer_node_id,
+                            e
+                        );
+
+                        matter.with_state(|state| {
+                            if let Some(id) = state
+                                .sessions
+                                .get_for_node(fab_idx, peer_node_id)
+                                .map(|s| s.id)
+                            {
+                                state.sessions.remove(id);
+                            }
+                        });
+
+                        // Keep the subscription to retry, but do NOT advance its
+                        // watermarks: the changes/events this report was carrying
+                        // never reached the subscriber and must be re-sent.
+                        rctx.set_keep_retry();
+                    }
                 }
+            }
+
+            // A subscription that was torn down during reporting is now gone from
+            // the table; re-persist so the on-disk set stays an exact mirror and
+            // the torn-down subscription is not resumed on the next reboot.
+            if dropped_any {
+                self.persist_subscriptions();
             }
 
             // Periodically trim changed-attr entries that have been reported by every
@@ -1005,24 +1410,18 @@ where
     }
 
     /// Process one valid subscription, reporting the data to the peer.
-    ///
-    /// Arguments:
-    /// - `matter` - a reference to the `Matter` instance
-    /// - `fabric_idx` - the fabric index of the peer
-    /// - `peer_node_id` - the node ID of the peer
-    /// - `session_id` - the session ID of the peer, if any
-    /// - `sub` - the received and saved data for the subscription, when the subscription was primed
-    /// - `min_event_number` - the subscription's current event watermark; updated
-    ///   in place as events are emitted so the caller can persist it
-    /// - `ctx` - the report context for this subscription
-    #[allow(clippy::too_many_arguments)]
     async fn process_subscription(
         &self,
         matter: &Matter<'_>,
         rctx: &mut ReportContext<'_, '_, B, NS>,
     ) -> Result<bool, Error> {
+        // Route the report by the subscriber's `(fabric, node)`: reuse the best
+        // live session to that peer, or (with the `case-responder-only` feature
+        // off) establish a fresh one on demand. A subscription is identified by
+        // its id, not bound to the session it was accepted on.
+        let ids = rctx.subscription().ids();
         let mut exchange =
-            Exchange::initiate_for_session(matter, rctx.subscription().session_id())?;
+            Exchange::initiate(matter, self.crypto(), ids.fab_idx, ids.peer_node_id).await?;
 
         if let Some(mut tx) = self.buffers.get().await {
             // Always safe as `IMBuffer` is defined to be `MAX_EXCHANGE_RX_BUF_SIZE`, which is bigger than `MAX_EXCHANGE_TX_BUF_SIZE`
@@ -1261,8 +1660,23 @@ where
     }
 }
 
-impl<C, B, T, K, N, NC, const NS: usize, const NE: usize> ExchangeHandler
-    for InteractionModel<'_, C, B, T, K, N, NC, NS, NE>
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> ExchangeHandler
+    for InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
+where
+    C: Crypto,
+    B: Buffers<IMBuffer>,
+    T: DataModel,
+    K: KvBlobStoreAccess,
+    N: Networks,
+    R: ReportDataHandler,
+{
+    async fn handle(&self, mut exchange: Exchange<'_>) -> Result<(), Error> {
+        InteractionModel::handle(self, &mut exchange).await
+    }
+}
+
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize>
+    InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -1270,13 +1684,46 @@ where
     K: KvBlobStoreAccess,
     N: Networks,
 {
-    async fn handle(&self, mut exchange: Exchange<'_>) -> Result<(), Error> {
-        InteractionModel::handle(self, &mut exchange).await
+    /// The node's resource-utilisation metrics, for the `GeneralDiagnostics`
+    /// cluster's `DeviceLoadStatus` attribute.
+    ///
+    /// `fab_idx` is the fabric of the reading subject, for
+    /// `CurrentSubscriptionsForFabric`; pass `None` when no fabric is in scope.
+    ///
+    /// Handlers reach this through [`ImStats::device_load`] rather than calling
+    /// it directly, but it is public so a controller can query its own load.
+    ///
+    /// Deliberately free of the `R: ReportDataHandler` bound the other
+    /// `InteractionModel` methods carry: the figures come from the transport and
+    /// the subscriptions table, so both the accessory and controller roles can
+    /// report them.
+    pub fn load_stats(&self, fab_idx: Option<NonZeroU8>) -> DeviceLoad {
+        let message_counters = self.matter.transport().counters();
+
+        DeviceLoad {
+            total_im_messages_sent: message_counters.im_sent,
+            total_im_messages_received: message_counters.im_received,
+            ..self.state.subscriptions().load_stats(fab_idx)
+        }
     }
 }
 
-impl<C, B, T, K, N, NC, const NS: usize, const NE: usize> HandlerContext
-    for InteractionModel<'_, C, B, T, K, N, NC, NS, NE>
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> ImStats
+    for InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
+where
+    C: Crypto,
+    B: Buffers<IMBuffer>,
+    T: DataModel,
+    K: KvBlobStoreAccess,
+    N: Networks,
+{
+    fn device_load(&self, fab_idx: Option<NonZeroU8>) -> DeviceLoad {
+        self.load_stats(fab_idx)
+    }
+}
+
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> HandlerContext
+    for InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -1311,10 +1758,29 @@ where
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
         self.buffers
     }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        self
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        if let Err(e) = self
+            .handler
+            .lifecycle(self, LifecycleOp::FabricRemoval { fab_idx })
+        {
+            warn!(
+                "Failed to broadcast the removal of fabric {}: {:?}",
+                fab_idx, e
+            );
+        }
+
+        #[cfg(feature = "groups")]
+        self.matter.transport().notify_groups_changed();
+    }
 }
 
-impl<C, B, T, K, N, NC, const NS: usize, const NE: usize> AttrChangeNotifier
-    for InteractionModel<'_, C, B, T, K, N, NC, NS, NE>
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> AttrChangeNotifier
+    for InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -1357,8 +1823,8 @@ where
     }
 }
 
-impl<C, B, T, K, N, NC, const NS: usize, const NE: usize> EventEmitter
-    for InteractionModel<'_, C, B, T, K, N, NC, NS, NE>
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> EventEmitter
+    for InteractionModel<'_, C, B, T, K, N, NC, R, NS, NE>
 where
     C: Crypto,
     B: Buffers<IMBuffer>,
@@ -1493,7 +1959,7 @@ where
         M: Metadata,
         F: FnMut(EndptId, ClusterId, u32) -> bool,
     {
-        let accessor = self.invoker.exchange().accessor()?;
+        let accessor = self.invoker.exchange().accessor(&metadata)?;
 
         if self.req.attr_requests()?.is_some() {
             wb.start_array(&TLVTag::Context(ReportDataRespTag::AttributeReports as u8))?;
@@ -1552,7 +2018,7 @@ where
     where
         M: Metadata,
     {
-        let accessor = self.invoker.exchange().accessor()?;
+        let accessor = self.invoker.exchange().accessor(&metadata)?;
 
         if let Some(event_reqs) = self.req.event_requests()? {
             wb.start_array(&TLVTag::Context(ReportDataRespTag::EventReports as _))?;
@@ -1901,7 +2367,7 @@ where
     where
         M: Metadata,
     {
-        let accessor = self.invoker.exchange().accessor()?;
+        let accessor = self.invoker.exchange().accessor(&metadata)?;
 
         wb.reset();
 
@@ -1983,10 +2449,111 @@ where
             wb.start_array(&TLVTag::Context(InvRespTag::InvokeResponses as u8))?;
         }
 
-        let accessor = self.invoker.exchange().accessor()?;
+        let accessor = self.invoker.exchange().accessor(&metadata)?;
+
+        // When the Groupcast testing mode is armed for listener testing by
+        // this group session's fabric, record an observation per processed
+        // path (turned into `GroupcastTesting` events by the Groupcast
+        // handler): a success per invoked concrete path, or - when nothing
+        // was invocable at all (typically: access denied on every group
+        // endpoint) - a single failed-auth observation.
+        // (For invokes, `suppress_resp` is set exactly for group-addressed
+        // requests - see the `respond` callers.)
+        #[cfg(feature = "groups")]
+        let group_testing = if suppress_resp {
+            let exchange = self.invoker.exchange();
+
+            exchange
+                .matter()
+                .groupcast_testing()
+                .armed(crate::dm::clusters::groupcast::GroupcastTestingEnum::EnableListenerTesting)
+                .and_then(|mode| {
+                    exchange
+                        .with_state(|state| {
+                            let sess = exchange.id().session(&mut state.sessions);
+
+                            let crate::transport::session::SessionMode::Group {
+                                fab_idx,
+                                group_id,
+                            } = sess.get_session_mode()
+                            else {
+                                return Ok(None);
+                            };
+
+                            if *fab_idx != mode.fab_idx {
+                                return Ok(None);
+                            }
+
+                            let src_ip = crate::dm::clusters::groupcast::TestingObservation::addr_ip(&sess.get_peer_addr());
+                            let group_id = *group_id;
+                            let fab_idx = *fab_idx;
+                            let dst_ip = crate::dm::clusters::groupcast::TestingObservation::group_dst_ip(
+                                &state.fabrics,
+                                fab_idx,
+                                group_id,
+                            );
+
+                            Ok(Some((group_id, src_ip, dst_ip)))
+                        })
+                        .unwrap_or(None)
+                })
+        } else {
+            None
+        };
+
+        #[cfg(feature = "groups")]
+        let mut any_invoked = false;
 
         for item in expand_invoke(metadata, self.req, &accessor)? {
-            self.invoker.process_invoke(&item?, &mut *wb).await?;
+            let item = item?;
+            #[cfg_attr(not(feature = "groups"), allow(unused_variables))]
+            let invoked = self.invoker.process_invoke(&item, &mut *wb).await?;
+
+            #[cfg(feature = "groups")]
+            if invoked {
+                any_invoked = true;
+
+                if let (Some((group_id, src_ip, dst_ip)), Ok((cmd, _))) = (&group_testing, &item) {
+                    self.invoker
+                        .exchange()
+                        .matter()
+                        .groupcast_testing()
+                        .observe(crate::dm::clusters::groupcast::TestingObservation {
+                            src_ip: *src_ip,
+                            dst_ip: Some(*dst_ip),
+                            group_id: Some(*group_id),
+                            endpoint_id: Some(cmd.endpoint_id),
+                            cluster_id: Some(cmd.cluster_id),
+                            element_id: Some(cmd.cmd_id),
+                            access_allowed: Some(true),
+                            result:
+                                crate::dm::clusters::groupcast::GroupcastTestResultEnum::Success,
+                        });
+                }
+            }
+        }
+
+        #[cfg(feature = "groups")]
+        if let Some((group_id, src_ip, dst_ip)) = group_testing {
+            if !any_invoked {
+                // Nothing was invokable for this group message - report it
+                // as access-denied (the dominant cause: no ACL grant covers
+                // the group's endpoints)
+                self.invoker
+                    .exchange()
+                    .matter()
+                    .groupcast_testing()
+                    .observe(crate::dm::clusters::groupcast::TestingObservation {
+                        src_ip,
+                        dst_ip: Some(dst_ip),
+                        group_id: Some(group_id),
+                        endpoint_id: None,
+                        cluster_id: None,
+                        element_id: None,
+                        access_allowed: Some(false),
+                        result: crate::dm::clusters::groupcast::GroupcastTestResultEnum::FailedAuth,
+                    });
+            }
         }
 
         if suppress_resp {

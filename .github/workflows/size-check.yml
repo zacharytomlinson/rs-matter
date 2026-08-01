@@ -9,8 +9,22 @@ on:
     - cron: "50 6 * * *"
   workflow_dispatch:
 
+# Pushing a new commit to a pull request supersedes the run already in flight for it.
+#
+# The trade-off is that commits pushed in quick succession onto a pull request do not each get
+# a size report; only the newest one does. The report for the final state of the branch is the
+# one that matters for review, so that is accepted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
-  RUST_TOOLCHAIN: stable
+  # Pinned (rather than floating `stable`) so that size reports stay
+  # comparable across runs: a compiler upgrade can move codegen by whole
+  # percents, and with a floating toolchain that delta gets attributed to
+  # whatever PR is measured after the release. Bump deliberately, in its own
+  # PR, so the size change is visible in isolation.
+  RUST_TOOLCHAIN: "1.97.1"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   CARGO_TERM_COLOR: always
 

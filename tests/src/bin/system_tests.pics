@@ -618,13 +618,16 @@ PRS.C.AO-WRITE=0
 # Groups Cluster
 G.S=1
 G.S.F00=1
-G.S.A0000=0
+G.S.A0000=1
 G.S.C00.Rsp=1
 G.S.C01.Rsp=1
 G.S.C02.Rsp=1
 G.S.C03.Rsp=1
 G.S.C04.Rsp=1
-G.S.C05.Rsp=0
+G.S.C05.Rsp=1
+# Groups cluster present on more than one endpoint (EP0, EP1 and EP2 here),
+# as required by Test_TC_G_2_4
+MCORE.G.MULTIENDPOINT=1
 G.S.C00.Tx=1
 G.S.C01.Tx=1
 G.S.C02.Tx=1
@@ -642,10 +645,17 @@ G.C.C05.Tx=0
 GRPKEY.S=1
 # No support for the CacheAndSync feature so far
 GRPKEY.S.F00=0
+# Malformed spelling of GRPKEY.S.F00 used by a Test_TC_GRPKEY_2_2 step gate
+GRPKEY.F00=0
+# Groupcast (Matter 1.6). Not implemented - the cluster metadata is built with
+# `with!(required)`, so the provisional `GroupcastAdoption` attribute is not
+# advertised either.
+GRPKEY.S.F01=0
 GRPKEY.S.A0000=1
 GRPKEY.S.A0001=1
 GRPKEY.S.A0002=1
 GRPKEY.S.A0003=1
+GRPKEY.S.A0004=0
 
 GRPKEY.S.C00.Rsp=1
 GRPKEY.S.C01.Rsp=1
@@ -712,8 +722,10 @@ S.C.AO-READ=0
 S.C.AO-WRITE=0
 
 # Switch Cluster
-SWTCH.S=1
-SWTCH.S.F00=1
+# No Switch cluster handler exists (the `TC_SWTCH` Python test skips all of
+# its methods) - claiming `SWTCH.S=1` here would be a PICS/device mismatch.
+SWTCH.S=0
+SWTCH.S.F00=0
 SWTCH.S.F01=0
 SWTCH.S.F02=0
 SWTCH.S.F03=0
@@ -938,6 +950,9 @@ DGGEN.S.A0005=1
 DGGEN.S.A0006=1
 DGGEN.S.A0007=1
 DGGEN.S.A0008=1
+# A000a (DeviceLoadStatus) is new and optional in Matter 1.6. `GenDiagHandler`
+# builds its metadata with `with!(required; UpTime)`, so it is not advertised.
+DGGEN.S.A000a=0
 DGGEN.S.C00.Rsp=1
 DGGEN.S.C03.Rsp=1
 DGGEN.S.E00=1
@@ -1039,7 +1054,7 @@ PS.S.A0001=1
 PS.S.A0002=1
 PS.S.A0003=0
 PS.S.A0004=0
-PS.S.A0005=0
+PS.S.A0005=1
 PS.S.A0006=0
 PS.S.A0007=0
 PS.S.A0008=0
@@ -1067,15 +1082,15 @@ PS.S.A001d=0
 PS.S.A001e=0
 PS.S.A001f=1
 PS.S.E00=0
-PS.S.E01=1
+PS.S.E01=0
 PS.S.E02=0
-PS.S.F00=0
-PS.S.F01=1
+PS.S.F00=1
+PS.S.F01=0
 PS.S.F02=0
 PS.S.F03=0
-PS.S.M.ManualWiredFault=1
-PS.S.M.ManualBatFault=1
-PS.S.M.ManualBatChargeFault=1
+PS.S.M.ManualWiredFault=0
+PS.S.M.ManualBatFault=0
+PS.S.M.ManualBatChargeFault=0
 
 PS.C=0
 PS.C.AM-READ=0
@@ -1143,23 +1158,27 @@ MCORE.DD.COMMISSIONING_SUBTYPE_T=1
 
 
 # Ethernet Network Diagnostics Cluster
+# `eth_diag::EthDiagHandler` declares `with_attrs(with!(required))` and
+# `with_cmds(with!())`. Every attribute of this cluster is optional and
+# `ResetCounts` is the only command, so the handler serves the global
+# attributes and nothing else - hence the zeros below.
 DGETH.S=1
-DGETH.S.C00.Rsp=1
+DGETH.S.C00.Rsp=0
 
 
 
 DGETH.C=1
 DGETH.C.C00.Tx=1
 # Server
-DGETH.S.A0000=1
-DGETH.S.A0001=1
-DGETH.S.A0002=1
-DGETH.S.A0003=1
-DGETH.S.A0004=1
-DGETH.S.A0005=1
-DGETH.S.A0006=1
-DGETH.S.A0007=1
-DGETH.S.A0008=1
+DGETH.S.A0000=0
+DGETH.S.A0001=0
+DGETH.S.A0002=0
+DGETH.S.A0003=0
+DGETH.S.A0004=0
+DGETH.S.A0005=0
+DGETH.S.A0006=0
+DGETH.S.A0007=0
+DGETH.S.A0008=0
 # Client
 DGETH.C.A0000=1
 DGETH.C.A0001=1
@@ -1172,7 +1191,7 @@ DGETH.C.A0007=1
 DGETH.C.A0008=1
 # Features
 DGETH.S.F00=0
-DGETH.S.F01=1
+DGETH.S.F01=0
 
 # Wi-Fi Network Diagnostics Cluster
 DGWIFI.S=1
@@ -1703,21 +1722,38 @@ BINFO.S.A0013=1
 BINFO.S.A0014=1
 BINFO.S.A0015=1
 BINFO.S.A0016=1
-# A0018 (ConfigurationVersion) is provisional in Matter 1.5 and is not
-# exposed by the default `BasicInfoHandler` metadata — see the comment on
-# `BasicInfoHandler::CLUSTER` in `rs-matter/src/dm/clusters/basic_info.rs`.
-BINFO.S.A0018=0
+# A0017 (DeviceLocation) is implemented (admin-writable, persisted in
+# `BasicInfoSettings`) but provisional in Matter 1.6, so it is excluded from
+# the default `BasicInfoHandler` metadata (upstream's `TestBasicInformation`
+# pins `AttributeList` to an exact set without it). The `--app-pipe`-selected
+# alternate node advertises it via `basic_info::CLUSTER_DEVICE_LOCATION`, which
+# is how `TC_BINFO_2_1` exercises its steps 24-28; that test gates those steps
+# on the live `AttributeList` (`attribute_guard`), not on this PICS entry.
+BINFO.S.A0017=0
+# A0018 (ConfigurationVersion) IS exposed by default: although provisional, its
+# conformance is `P, Rev >= v5`, i.e. mandatory from cluster revision 5 onwards,
+# and `BasicInformation` is revision 6 in Matter 1.6. `TestBasicInformation`
+# constrains `AttributeList` to an exact set that includes it.
+BINFO.S.A0018=1
 
-# Manufacturer-specific.
-# Disabled here because the default device doesn't expose `ConfigurationVersion`,
-# so `TC_BINFO_3_2` is PICS-gated off via `pics_TC_BINFO_3_2`.
+# Manufacturer-specific: whether the device can be made to change its
+# configuration and bump `ConfigurationVersion` on demand.
+#
+# Left disabled. The original rationale ("the default device doesn't expose
+# `ConfigurationVersion`") no longer holds - it is exposed by default as of
+# Matter 1.6 - and it never gated `TC_BINFO_3_2` anyway, since that test is run
+# against CHIP's own `certification/ci-pics-values` file rather than this one
+# (see `extra_python_script_args` in `xtask/src/itest.rs`). Enabling it is a
+# separate question from the 1.6 bump: it would opt this device into the
+# simulated-bump assertions of any test that reads this PICS file, which has
+# not been exercised.
 BINFO.S.M.DeviceConfigurationChange=0
 
 # Events
 BINFO.S.E00=1
-BINFO.S.E01=1
+BINFO.S.E01=0
 BINFO.S.E02=1
-BINFO.S.E03=1
+BINFO.S.E03=0
 
 # Client Attributes
 BINFO.C=1
@@ -1751,11 +1787,16 @@ BINFO.C.E03=1
 # NetworkCommissioning Cluster
 
 # Server Attributes
+# `system_tests` serves the Ethernet flavour of the cluster
+# (`net_comm::NetworkType::Ethernet`), which is `with_attrs(with!(required))`
+# plus `with_cmds(with!())`: ScanMaxTimeSeconds (A0002) and
+# ConnectMaxTimeSeconds (A0003) are optional and the network-provisioning
+# commands belong to the Wi-Fi / Thread flavours, so none of them are served.
 CNET.S=1
 CNET.S.A0000=1
 CNET.S.A0001=1
-CNET.S.A0002=1
-CNET.S.A0003=1
+CNET.S.A0002=0
+CNET.S.A0003=0
 CNET.S.A0004=1
 CNET.S.A0005=1
 CNET.S.A0006=1
@@ -1770,15 +1811,15 @@ CNET.S.F01=0
 CNET.S.F02=1
 
 # Server Commands
-CNET.S.C00.Rsp=1
-CNET.S.C01.Tx=1
-CNET.S.C02.Rsp=1
-CNET.S.C03.Rsp=1
-CNET.S.C04.Rsp=1
-CNET.S.C05.Tx=1
-CNET.S.C06.Rsp=1
-CNET.S.C07.Tx=1
-CNET.S.C08.Rsp=1
+CNET.S.C00.Rsp=0
+CNET.S.C01.Tx=0
+CNET.S.C02.Rsp=0
+CNET.S.C03.Rsp=0
+CNET.S.C04.Rsp=0
+CNET.S.C05.Tx=0
+CNET.S.C06.Rsp=0
+CNET.S.C07.Tx=0
+CNET.S.C08.Rsp=0
 
 CNET.C=1
 
@@ -2211,14 +2252,14 @@ MCORE.IDM.S.PersistentSubscription=1
 # Time Synchronization
 TIMESYNC.S=1
 TIMESYNC.S.F00=1
-TIMESYNC.S.F01=1
+TIMESYNC.S.F01=0
 TIMESYNC.S.F02=0
 TIMESYNC.S.F03=1
 TIMESYNC.S.A0000=1
 TIMESYNC.S.A0001=1
 TIMESYNC.S.A0002=1
 TIMESYNC.S.A0003=1
-TIMESYNC.S.A0004=1
+TIMESYNC.S.A0004=0
 TIMESYNC.S.A0005=1
 TIMESYNC.S.A0006=1
 TIMESYNC.S.A0007=1
@@ -2226,13 +2267,17 @@ TIMESYNC.S.A0008=1
 TIMESYNC.S.A0009=0
 TIMESYNC.S.A000a=1
 TIMESYNC.S.A000b=1
-TIMESYNC.S.A000c=1
+TIMESYNC.S.A000c=0
 TIMESYNC.S.C00.Rsp=1
 TIMESYNC.S.C01.Rsp=1
 TIMESYNC.S.C02.Rsp=1
 TIMESYNC.S.C04.Rsp=1
-TIMESYNC.S.C05.Rsp=1
+TIMESYNC.S.C05.Rsp=0
 TIMESYNC.S.C03.Tx=1
+TIMESYNC.S.E00=1
+TIMESYNC.S.E01=1
+TIMESYNC.S.E02=1
+TIMESYNC.S.E03=1
 TIMESYNC.C=0
 
 # HEPA Filter Monitoring Cluster
@@ -2671,7 +2716,7 @@ FAN.S.C00.Rsp=1
 
 #Server
 ICDM.S=1
-ICDM.C=1
+ICDM.C=0
 
 #Server Attribute
 ICDM.S.A0000=1
@@ -2682,35 +2727,25 @@ ICDM.S.A0004=1
 ICDM.S.A0005=1
 ICDM.S.A0006=1
 ICDM.S.A0007=1
-
-#Client Attribute
-ICDM.C.A0000=1
-ICDM.C.A0001=1
-ICDM.C.A0002=1
-ICDM.C.A0003=1
-ICDM.C.A0004=1
-ICDM.C.A0005=1
-ICDM.C.A0006=1
-ICDM.C.A0007=1
-
+ICDM.S.A0008=1
+ICDM.S.A0009=1
 
 #Features
 ICDM.S.F00=1
 ICDM.S.F01=1
 ICDM.S.F02=1
+ICDM.S.F03=1
 
 #Commands
 ICDM.S.C00.Rsp=1
 ICDM.S.C02.Rsp=1
 ICDM.S.C03.Rsp=1
 ICDM.S.C01.Tx=1
+ICDM.S.C04.Tx=1
 
-ICDM.C.C01.Rsp=0
-ICDM.C.C04.Rsp=0
 ICDM.S.C00.Tx=0
 ICDM.S.C02.Tx=0
 ICDM.S.C03.Tx=0
-ICDM.S.C04.Tx=0
 
 # Smoke CO Alarm Cluster
 SMOKECO.S=1

@@ -61,7 +61,6 @@ use rs_matter::error::{Error, ErrorCode};
 use rs_matter::im::{EthInteractionModelState, InteractionModel};
 use rs_matter::pairing::qr::QrTextType;
 use rs_matter::pairing::DiscoveryCapabilities;
-use rs_matter::persist::KvBlobStoreAccess;
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
 use rs_matter::tlv::Nullable;
@@ -94,22 +93,6 @@ static SCENES_STATE: StaticCell<ScenesState<SCENES_CAPACITY>> = StaticCell::new(
 static UNIT_TESTING_DATA: StaticCell<RefCell<UnitTestingHandlerData>> = StaticCell::new();
 
 fn main() -> Result<(), Error> {
-    let thread = std::thread::Builder::new()
-        // Increase the stack size until the example can work without stack blowups.
-        // Note that the used stack size increases exponentially by lowering the level of compiler optimizations,
-        // as lower optimization settings prevent the Rust compiler from inlining constructor functions
-        // which often results in (unnecessary) memory moves and increased stack utilization:
-        // e.g., an opt-level of "0" will require a several times' larger stack.
-        //
-        // Optimizing/lowering `rs-matter` memory consumption is an ongoing topic.
-        .stack_size(550 * 1024)
-        .spawn(run)
-        .unwrap();
-
-    thread.join().unwrap()
-}
-
-fn run() -> Result<(), Error> {
     env_logger::builder()
         .format(|buf, record| {
             use std::io::Write;
@@ -138,9 +121,8 @@ fn run() -> Result<(), Error> {
     // Bind the KV access object (the KV scratch buffer lives in `Matter`).
     let kv = matter.kv(store);
 
-    // Re-hydrate the `Matter` instance and the data model state (event-number epoch).
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
-    futures_lite::future::block_on(state.load_persist(&kv))?;
+    // Re-hydrate the `Matter` instance (fabrics, basic info, RTC).
+    matter.startup(&kv)?;
 
     // Create the crypto instance
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
@@ -154,7 +136,6 @@ fn run() -> Result<(), Error> {
         .init_with(RefCell::init(UnitTestingHandlerData::init()));
 
     let scenes_state = SCENES_STATE.uninit().init_with(ScenesState::init());
-    kv.access(|store, buf| futures_lite::future::block_on(scenes_state.load_persist(store, buf)))?;
 
     // OnOff cluster setup
     let on_off_handler =
@@ -201,6 +182,11 @@ fn run() -> Result<(), Error> {
         state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state (events epoch, network store) and deliver the `Startup` lifecycle op
+    // to all cluster handlers (here notably: the Scenes state).
+    futures_lite::future::block_on(im.startup())?;
+
     // Create a default responder capable of handling up to 3 subscriptions
     // All other subscription requests will be turned down with "resource exhausted"
     let responder = DefaultResponder::new(&im);
@@ -222,7 +208,7 @@ fn run() -> Result<(), Error> {
     // even if the device is already commissioned
     matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         // If the device is not commissioned yet, print the QR code to the console
         // and enable basic commissioning
 

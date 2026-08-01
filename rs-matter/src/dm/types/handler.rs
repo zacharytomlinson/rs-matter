@@ -16,16 +16,19 @@
  */
 
 use core::future::Future;
+use core::num::NonZeroU8;
 use core::pin::pin;
 
 use embassy_futures::select::select;
 
+use crate::acl::Accessor;
 use crate::crypto::Crypto;
 use crate::dm::clusters::net_comm::NetworksAccess;
 use crate::dm::{EventId, EventNumber, Metadata};
 use crate::error::{Error, ErrorCode};
-use crate::im::encoding::{EventPriority, IMBuffer};
+use crate::im::encoding::{EventPriority, IMBuffer, NodeId};
 use crate::im::events::EventTLVWrite;
+use crate::im::ImStats;
 use crate::persist::KvBlobStoreAccess;
 use crate::tlv::TLVElement;
 use crate::transport::exchange::Exchange;
@@ -278,6 +281,25 @@ pub trait HandlerContext: AttrChangeNotifier + EventEmitter {
     /// Useful in case e.g. a concrete cluster handler needs to invoke read/write/invoke operations on
     /// other clusters, and the TLV input/output data for those operations is non-trivial in size.
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_;
+
+    /// Return the Interaction Model statistics of the node.
+    ///
+    /// Lets a handler read IM-internal figures it cannot otherwise reach - the
+    /// General Diagnostics handler uses it for `DeviceLoadStatus`.
+    fn im_stats(&self) -> impl ImStats + '_;
+
+    /// Notify that the fabric with the given local index has been removed
+    /// from the fabric table, by synchronously broadcasting
+    /// [`LifecycleOp::FabricRemoval`] to every handler in the data model.
+    ///
+    /// Two caveats for callers:
+    /// - The broadcast runs the handlers' `lifecycle` methods inline, so this
+    ///   must NOT be called while holding the Matter state lock (i.e. from
+    ///   within a `with_state` closure) - handlers are free to access the
+    ///   Matter instance themselves.
+    /// - For the same reason, a handler must not call this from its own
+    ///   `lifecycle` implementation (infinite recursion).
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8);
 }
 
 impl<T> HandlerContext for &T
@@ -310,6 +332,14 @@ where
 
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
         (**self).buffers()
+    }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        (**self).im_stats()
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        (**self).notify_fabric_removed(fab_idx);
     }
 }
 
@@ -365,6 +395,11 @@ pub trait OperationContext:
 {
     /// Return the exchange object that is associated with this operation.
     fn exchange(&self) -> &Exchange<'_>;
+
+    /// Return the accessor object that is associated with this operation.
+    fn accessor(&self) -> Result<Accessor<'_>, Error> {
+        self.exchange().accessor(self.metadata())
+    }
 }
 
 impl<T> OperationContext for &T
@@ -373,6 +408,10 @@ where
 {
     fn exchange(&self) -> &Exchange<'_> {
         (**self).exchange()
+    }
+
+    fn accessor(&self) -> Result<Accessor<'_>, Error> {
+        (**self).accessor()
     }
 }
 
@@ -447,6 +486,58 @@ where
     }
 }
 
+/// The identity of the subscription (and the peer that owns it) that a
+/// server-initiated `ReportData` message belongs to.
+///
+/// Reachable from a [`ReportContext`] via [`ReportContext::subscription`] and
+/// handed (indirectly) to a [`ReportDataHandler`] so it can route the report to
+/// the right in-flight subscription. The `(fabric_idx, peer_node_id,
+/// subscription_id)` triple is exactly the key a controller records when it
+/// establishes a subscription (see the IM client's `SubscribeEstablished`), and
+/// mirrors how the C++ SDK matches an unsolicited `ReportData` to its
+/// `ReadClient`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SubscriptionCtx {
+    /// The local fabric index the report arrived on.
+    pub fabric_idx: NonZeroU8,
+    /// The node ID of the peer (publisher) that sent the report.
+    pub peer_node_id: NodeId,
+    /// The subscription ID carried in the report, if any. `None` for an
+    /// unsolicited (subscription-less) `ReportData` — legal on the wire but not
+    /// expected in the controller subscription flow.
+    pub subscription_id: Option<u32>,
+}
+
+/// A context type passed to a [`ReportDataHandler`] when it processes a
+/// server-initiated `ReportData` message (the controller / subscriber role).
+///
+/// Like [`ReadContext`] / [`InvokeContext`], it is a [`HandlerContext`] — so the
+/// report handler has the same ambient access to the [`Matter`] stack, crypto,
+/// KV store, networks, node metadata and buffer pool as any cluster handler —
+/// plus the originating [`Exchange`] and the [`SubscriptionCtx`] identifying the
+/// subscription the report belongs to.
+pub trait ReportContext: HandlerContext {
+    /// The exchange the report arrived on.
+    fn exchange(&self) -> &Exchange<'_>;
+
+    /// The `(fabric, peer, subscription-id)` identity of the report.
+    fn subscription(&self) -> SubscriptionCtx;
+}
+
+impl<T> ReportContext for &T
+where
+    T: ReportContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        (**self).exchange()
+    }
+
+    fn subscription(&self) -> SubscriptionCtx {
+        (**self).subscription()
+    }
+}
+
 /// A concrete implementation of the `ReadContext` trait
 pub(crate) struct ReadContextInstance<'a, C> {
     exchange: &'a Exchange<'a>,
@@ -499,6 +590,14 @@ where
 
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
         self.context.buffers()
+    }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        self.context.im_stats()
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        self.context.notify_fabric_removed(fab_idx);
     }
 }
 
@@ -615,6 +714,128 @@ where
     }
 }
 
+/// A concrete implementation of the [`ReportContext`] trait.
+pub(crate) struct ReportContextInstance<'a, C> {
+    exchange: &'a Exchange<'a>,
+    context: C,
+    subscription: SubscriptionCtx,
+}
+
+impl<'a, C> ReportContextInstance<'a, C>
+where
+    C: HandlerContext,
+{
+    /// Construct a new instance.
+    #[inline(always)]
+    pub(crate) const fn new(
+        exchange: &'a Exchange<'a>,
+        context: C,
+        subscription: SubscriptionCtx,
+    ) -> Self {
+        Self {
+            exchange,
+            context,
+            subscription,
+        }
+    }
+}
+
+impl<C> HandlerContext for ReportContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn matter(&self) -> &Matter<'_> {
+        self.context.matter()
+    }
+
+    fn crypto(&self) -> impl Crypto + '_ {
+        self.context.crypto()
+    }
+
+    fn kv(&self) -> impl KvBlobStoreAccess + '_ {
+        self.context.kv()
+    }
+
+    fn networks(&self) -> impl NetworksAccess + '_ {
+        self.context.networks()
+    }
+
+    fn metadata(&self) -> impl Metadata + '_ {
+        self.context.metadata()
+    }
+
+    fn handler(&self) -> impl AsyncHandler + '_ {
+        self.context.handler()
+    }
+
+    fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
+        self.context.buffers()
+    }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        self.context.im_stats()
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        self.context.notify_fabric_removed(fab_idx);
+    }
+}
+
+impl<C> AttrChangeNotifier for ReportContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn notify_attr_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId, attr_id: AttrId) {
+        self.context
+            .notify_attr_changed(endpoint_id, cluster_id, attr_id);
+    }
+
+    fn notify_cluster_changed(&self, endpoint_id: EndptId, cluster_id: ClusterId) {
+        self.context.notify_cluster_changed(endpoint_id, cluster_id);
+    }
+
+    fn notify_endpoint_changed(&self, endpoint_id: EndptId) {
+        self.context.notify_endpoint_changed(endpoint_id);
+    }
+
+    fn notify_all_changed(&self) {
+        self.context.notify_all_changed();
+    }
+}
+
+impl<C> EventEmitter for ReportContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn emit_event<F>(
+        &self,
+        endpoint_id: EndptId,
+        cluster_id: ClusterId,
+        event_id: EventId,
+        priority: EventPriority,
+        f: F,
+    ) -> Result<EventNumber, Error>
+    where
+        F: FnOnce(EventTLVWrite<'_>) -> Result<(), Error>,
+    {
+        self.context
+            .emit_event(endpoint_id, cluster_id, event_id, priority, f)
+    }
+}
+
+impl<C> ReportContext for ReportContextInstance<'_, C>
+where
+    C: HandlerContext,
+{
+    fn exchange(&self) -> &Exchange<'_> {
+        self.exchange
+    }
+
+    fn subscription(&self) -> SubscriptionCtx {
+        self.subscription
+    }
+}
+
 /// A context implementation of the `WriteContext` trait
 pub(crate) struct WriteContextInstance<'a, C> {
     exchange: &'a Exchange<'a>,
@@ -675,6 +896,14 @@ where
 
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
         self.context.buffers()
+    }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        self.context.im_stats()
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        self.context.notify_fabric_removed(fab_idx);
     }
 }
 
@@ -856,6 +1085,14 @@ where
     fn buffers(&self) -> impl Buffers<IMBuffer> + '_ {
         self.context.buffers()
     }
+
+    fn im_stats(&self) -> impl ImStats + '_ {
+        self.context.im_stats()
+    }
+
+    fn notify_fabric_removed(&self, fab_idx: NonZeroU8) {
+        self.context.notify_fabric_removed(fab_idx);
+    }
 }
 
 impl<C> AttrChangeNotifier for InvokeContextInstance<'_, C>
@@ -978,6 +1215,53 @@ where
 pub trait DataModel: Metadata + AsyncHandler {}
 impl<T> DataModel for T where T: Metadata + AsyncHandler {}
 
+/// A lifecycle operation delivered to a handler via [`Handler::lifecycle`] /
+/// [`AsyncHandler::lifecycle`].
+///
+/// Unlike read/write/invoke - which are routed to the single handler matching the
+/// operation path - lifecycle operations are broadcast to every handler in the
+/// handler chain.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum LifecycleOp {
+    /// The node is starting up.
+    ///
+    /// Delivered once, after the Data Model is constructed and before it starts
+    /// serving operations.
+    ///
+    /// The typical reaction is to populate the handler's in-memory state from
+    /// persisted storage ([`HandlerContext::kv`]) - the mirror image of the
+    /// on-the-fly persistence the handler does while serving operations.
+    Startup,
+    /// The node is being factory-reset.
+    ///
+    /// The typical reaction is to reset the handler's in-memory state to factory
+    /// defaults and remove the handler's persisted data from [`HandlerContext::kv`].
+    FactoryReset,
+    /// The fabric with the given local index has been removed from the node.
+    ///
+    /// Delivered synchronously (via [`HandlerContext::notify_fabric_removed`])
+    /// right after the fabric is gone from the fabric table - via the
+    /// `RemoveFabric` command, an `AddNOC` rollback, or a fail-safe expiry
+    /// that did not resurrect a persisted (pre-`UpdateNOC`) copy of the
+    /// fabric. NOT delivered when a fail-safe expiry reverts an in-progress
+    /// `UpdateNOC` - the fabric is still commissioned in that case.
+    ///
+    /// The typical reaction is to drop the removed fabric's entries from any
+    /// fabric-scoped state the handler owns *outside* the fabric table (a
+    /// bindings registry, a scene table, provider lists, ...) and re-persist.
+    /// State stored inside the `Fabric` object itself (ACLs, group keys)
+    /// needs no reaction - it is dropped with the fabric.
+    ///
+    /// Like every lifecycle operation this is a broadcast, so multiple
+    /// handler instances borrowing one shared registry each receive it -
+    /// reactions must be idempotent (a `retain`-style purge naturally is).
+    FabricRemoval {
+        /// The local index the removed fabric had
+        fab_idx: NonZeroU8,
+    },
+}
+
 /// A version of the `AsyncHandler` trait that never awaits any operation.
 ///
 /// Prefer this trait when implementing handlers that are known to be non-blocking and additionally,
@@ -999,6 +1283,16 @@ pub trait Handler {
     /// Bump the per-cluster `Dataver` for the cluster handler matching
     /// the supplied context `endpoint_id` / `cluster_id`.
     fn bump_dataver(&self, ctx: impl MatchContext);
+
+    /// Process a lifecycle operation ([`LifecycleOp`]).
+    ///
+    /// Unlike read/write/invoke - which are routed to the single handler matching the
+    /// operation path - this method is invoked on every handler in the handler chain.
+    ///
+    /// The default implementation does nothing.
+    fn lifecycle(&self, _ctx: impl HandlerContext, _op: LifecycleOp) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// A hook (a scheduling facility) for placing handler-impl-specific code that needs to run
     /// asynchronously - forever and in the "background".
@@ -1029,6 +1323,10 @@ where
         (**self).bump_dataver(ctx)
     }
 
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        (**self).lifecycle(ctx, op)
+    }
+
     fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
         (**self).run(ctx)
     }
@@ -1052,6 +1350,10 @@ where
 
     fn bump_dataver(&self, ctx: impl MatchContext) {
         (**self).bump_dataver(ctx)
+    }
+
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        (**self).lifecycle(ctx, op)
     }
 
     fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
@@ -1085,6 +1387,10 @@ where
 
     fn bump_dataver(&self, ctx: impl MatchContext) {
         self.1.bump_dataver(ctx)
+    }
+
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        self.1.lifecycle(ctx, op)
     }
 
     fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
@@ -1281,6 +1587,13 @@ where
         self.next.bump_dataver(ctx)
     }
 
+    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+        // Lifecycle ops are a broadcast: every handler in the chain gets them,
+        // regardless of the matcher.
+        self.handler.lifecycle(&ctx, op)?;
+        self.next.lifecycle(ctx, op)
+    }
+
     async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
         let mut handler = pin!(self.handler.run(&ctx));
         let mut next = pin!(self.next.run(&ctx));
@@ -1343,9 +1656,11 @@ mod asynch {
     use crate::error::{Error, ErrorCode};
     use crate::utils::select::Coalesce;
 
+    use crate::im::encoding::{IMStatusCode, ReportDataResp};
+
     use super::{
-        ChainedHandler, EmptyHandler, Handler, InvokeContext, NonBlockingHandler, ReadContext,
-        WriteContext,
+        ChainedHandler, EmptyHandler, Handler, InvokeContext, LifecycleOp, NonBlockingHandler,
+        ReadContext, ReportContext, WriteContext,
     };
 
     /// A handler for processing a single IM operation:
@@ -1426,6 +1741,21 @@ mod asynch {
         /// the supplied context `endpoint_id` / `cluster_id`.
         fn bump_dataver(&self, ctx: impl MatchContext);
 
+        /// Process a lifecycle operation ([`LifecycleOp`]).
+        ///
+        /// Unlike read/write/invoke - which are routed to the single handler matching the
+        /// operation path - this method is invoked on every handler in the handler chain.
+        ///
+        /// Deliberately synchronous - like [`AsyncHandler::bump_dataver`] -
+        /// even on the async handler trait, so that lifecycle broadcasts can
+        /// be dispatched eagerly from synchronous call sites (see
+        /// [`HandlerContext::notify_fabric_removed`]).
+        ///
+        /// The default implementation does nothing.
+        fn lifecycle(&self, _ctx: impl HandlerContext, _op: LifecycleOp) -> Result<(), Error> {
+            Ok(())
+        }
+
         /// A hook (a scheduling facility) for placing handler-impl-specific code that needs to run
         /// asynchronously - forever and in the "background".
         fn run(&self, _ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
@@ -1475,6 +1805,10 @@ mod asynch {
             (**self).bump_dataver(ctx)
         }
 
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            (**self).lifecycle(ctx, op)
+        }
+
         fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
             (**self).run(ctx)
         }
@@ -1520,8 +1854,95 @@ mod asynch {
             (**self).bump_dataver(ctx)
         }
 
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            (**self).lifecycle(ctx, op)
+        }
+
         fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
             (**self).run(ctx)
+        }
+    }
+
+    /// A handler for consuming server-initiated `ReportData` messages — the
+    /// controller/subscriber side of the Interaction Model.
+    ///
+    /// After a controller establishes a subscription (via the IM client), the
+    /// publisher pushes `ReportData` messages on fresh inbound exchanges
+    /// throughout the subscription's lifetime. The
+    /// [`InteractionModel`](crate::im::InteractionModel) accepts those exchanges
+    /// (it already owns all inbound IM traffic), parses each `ReportData` chunk,
+    /// ACKs it at the IM layer, and hands the parsed chunk to this trait via
+    /// [`handle_report`](Self::handle_report).
+    ///
+    /// The report handler is a **separate, peer capability** of the
+    /// [`InteractionModel`], alongside the [`DataModel`] cluster handler — not a
+    /// supertrait of `DataModel`. A pure accessory does not supply one: the
+    /// `InteractionModel`'s report handler defaults to `()`, whose
+    /// implementation disowns every inbound report with
+    /// [`IMStatusCode::InvalidSubscription`] (the same status the C++ SDK returns
+    /// for an unmatched report, which the publisher uses to tear a stale
+    /// subscription down). A controller injects a real one via
+    /// [`InteractionModel::new_with_reports`](crate::im::InteractionModel::new_with_reports).
+    ///
+    /// `handle_report` is invoked **once per received chunk** with a
+    /// [`ReportContext`] (a [`HandlerContext`] carrying the originating exchange
+    /// and the subscription identity) plus the parsed [`ReportDataResp`]
+    /// (borrowing the exchange RX buffer). The `InteractionModel` owns the
+    /// multi-chunk loop and the inter-chunk `StatusResponse(Success)` acks; a
+    /// handler that cares about chunk boundaries reads `report.more_chunks` and
+    /// reassembles across calls itself.
+    pub trait ReportDataHandler {
+        /// Handle a single received `ReportData` chunk.
+        ///
+        /// Returning `Ok(())` makes the `InteractionModel` reply
+        /// `StatusResponse(Success)`; returning `Err(code)` makes it reply
+        /// `StatusResponse(code)` (e.g. [`IMStatusCode::InvalidSubscription`] to
+        /// disown a subscription the controller no longer tracks).
+        fn handle_report(
+            &self,
+            ctx: impl ReportContext,
+            report: &ReportDataResp<'_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>>;
+    }
+
+    impl<T> ReportDataHandler for &T
+    where
+        T: ReportDataHandler,
+    {
+        fn handle_report(
+            &self,
+            ctx: impl ReportContext,
+            report: &ReportDataResp<'_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            (**self).handle_report(ctx, report)
+        }
+    }
+
+    impl<T> ReportDataHandler for &mut T
+    where
+        T: ReportDataHandler,
+    {
+        fn handle_report(
+            &self,
+            ctx: impl ReportContext,
+            report: &ReportDataResp<'_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            (**self).handle_report(ctx, report)
+        }
+    }
+
+    /// The accessory-role default report handler: a device that never subscribes
+    /// to anything disowns every inbound report with
+    /// [`IMStatusCode::InvalidSubscription`]. This is the default type of the
+    /// `InteractionModel`'s report-handler generic, so existing accessory call
+    /// sites are unaffected.
+    impl ReportDataHandler for () {
+        async fn handle_report(
+            &self,
+            _ctx: impl ReportContext,
+            _report: &ReportDataResp<'_>,
+        ) -> Result<(), IMStatusCode> {
+            Err(IMStatusCode::InvalidSubscription)
         }
     }
 
@@ -1563,6 +1984,10 @@ mod asynch {
 
         fn bump_dataver(&self, ctx: impl MatchContext) {
             self.1.bump_dataver(ctx)
+        }
+
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            self.1.lifecycle(ctx, op)
         }
 
         fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
@@ -1608,6 +2033,10 @@ mod asynch {
 
         fn bump_dataver(&self, ctx: impl MatchContext) {
             Handler::bump_dataver(&self.0, ctx)
+        }
+
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            Handler::lifecycle(&self.0, ctx, op)
         }
 
         fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {
@@ -1727,6 +2156,13 @@ mod asynch {
             self.next.bump_dataver(ctx)
         }
 
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            // Lifecycle ops are a broadcast: every handler in the chain gets them,
+            // regardless of the matcher.
+            self.handler.lifecycle(&ctx, op)?;
+            self.next.lifecycle(ctx, op)
+        }
+
         async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
             let mut handler = pin!(self.handler.run(&ctx));
             let mut next = pin!(self.next.run(&ctx));
@@ -1760,6 +2196,10 @@ mod asynch {
 
         fn bump_dataver(&self, ctx: impl MatchContext) {
             self.0.bump_dataver(ctx)
+        }
+
+        fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
+            self.0.lifecycle(ctx, op)
         }
 
         fn run(&self, ctx: impl HandlerContext) -> impl Future<Output = Result<(), Error>> {

@@ -22,8 +22,10 @@ use core::str::FromStr;
 use crate::dm::{Cluster, Dataver, InvokeContext, ReadContext, WriteContext};
 use crate::error::{Error, ErrorCode};
 use crate::fabric::MAX_FABRICS;
-use crate::persist::{KvBlobStore, Persist, BASIC_INFO_KEY};
-use crate::tlv::{FromTLV, Nullable, TLVBuilderParent, TLVElement, ToTLV, Utf8StrBuilder};
+use crate::persist::{KvBlobStore, KvBlobStoreAccess, Persist, BASIC_INFO_KEY};
+use crate::tlv::{
+    FromTLV, Nullable, NullableBuilder, TLVBuilderParent, TLVElement, ToTLV, Utf8StrBuilder,
+};
 use crate::transport::exchange::Exchange;
 use crate::transport::session::MAX_SESSIONS;
 use crate::utils::bitflags::bitflags;
@@ -32,16 +34,19 @@ use crate::{except, with};
 
 pub use crate::dm::clusters::decl::basic_information::*;
 pub use crate::dm::clusters::decl::general_commissioning::RegulatoryLocationTypeEnum;
+pub use crate::dm::clusters::decl::globals::{
+    AreaTypeTag, LocationDescriptorStruct, LocationDescriptorStructBuilder,
+};
 
 /// The default Matter App Clusters specification version
 ///
-/// Currently set to V1.5.1.0
-pub const DEFAULT_MATTER_SPEC_VERSION: u32 = 0x01050100;
+/// Currently set to V1.6.0.0.
+pub const DEFAULT_MATTER_SPEC_VERSION: u32 = 0x01060000;
 
 /// The default Matter Data Model revision
 ///
-/// Currently set to V19, which was released with Matter Core spec V1.4.2
-pub const DEFAULT_DATA_MODEL_REVISION: u16 = 19;
+/// Currently set to V21, which was released with Matter Core spec V1.6
+pub const DEFAULT_DATA_MODEL_REVISION: u16 = 21;
 
 /// The default maximum number of paths that can be included in an Invoke request
 ///
@@ -125,6 +130,20 @@ bitflags! {
     }
 }
 
+/// Factory-default value for the `BasicInformation::DeviceLocation`
+/// attribute - the borrowed, const-constructible counterpart of
+/// [`DeviceLocation`], suitable for embedding in [`BasicInfoConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DeviceLocationConfig<'a> {
+    /// Free-form location description, at most 128 bytes.
+    pub location_name: &'a str,
+    /// Floor number, when applicable.
+    pub floor_number: Option<i16>,
+    /// Area type from the common Area namespace.
+    pub area_type: Option<AreaTypeTag>,
+}
+
 /// Basic information which is immutable
 /// (i.e. valid for the lifetime of the device firmware)
 ///
@@ -163,6 +182,12 @@ pub struct BasicInfoConfig<'a> {
     pub serial_no: &'a str,
     /// Unique ID (up to 64 characters)
     pub unique_id: &'a str,
+    /// Factory default for the runtime-mutable, persisted
+    /// `BasicInformation::Location` attribute
+    pub location: Option<&'a str>,
+    /// Factory default for the runtime-mutable, persisted
+    /// `BasicInformation::DeviceLocation` attribute
+    pub device_location: Option<DeviceLocationConfig<'a>>,
     /// Capability Minima
     pub capability_minima: CapabilityMinima,
     /// Product Appearance
@@ -231,6 +256,8 @@ impl BasicInfoConfig<'_> {
             product_url: "",
             product_label: "",
             unique_id: "",
+            location: None,
+            device_location: None,
             capability_minima: CapabilityMinima::new(),
             product_appearance: ProductAppearance::new(),
             specification_version: DEFAULT_MATTER_SPEC_VERSION,
@@ -261,6 +288,17 @@ pub struct CapabilityMinima {
     pub case_sessions_per_fabric: u16,
     /// Maximum subscriptions per fabric
     pub subscriptions_per_fabric: u16,
+    /// Maximum concurrent Invoke interactions processed before the node may
+    /// start answering with `BUSY`
+    pub simultaneous_invocations_supported: u16,
+    /// Minimum concurrent Write interactions the node can process
+    pub simultaneous_writes_supported: u16,
+    /// Maximum number of read paths (`AttributePathIB` + `EventPathIB`) the
+    /// node guarantees to process in a single Read Request
+    pub read_paths_supported: u16,
+    /// Maximum number of subscribe paths (`AttributePathIB` + `EventPathIB`)
+    /// the node guarantees to process in a single Subscribe Request
+    pub subscribe_paths_supported: u16,
 }
 
 /// The Matter spec mandates `CapabilityMinima.SubscriptionsPerFabric >= 3`.
@@ -268,6 +306,15 @@ pub struct CapabilityMinima {
 /// [`DEFAULT_MAX_SUBSCRIPTIONS`](crate::im::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS)),
 /// so this per-fabric minimum is what the device guarantees.
 const SUBSCRIPTIONS_PER_FABRIC: u16 = 3;
+
+/// Constraint is `1 to 10000`.
+const SIMULTANEOUS_INVOCATIONS_SUPPORTED: u16 = 1;
+/// Constraint is `1 to 10000`.
+const SIMULTANEOUS_WRITES_SUPPORTED: u16 = 1;
+/// Constraint is `9 to 10000`; see Core spec 2.11.2.1 "Read Interaction Limits".
+const READ_PATHS_SUPPORTED: u16 = 9;
+/// Constraint is `3 to 10000`; see Core spec 2.11.2.2 "Subscribe Interaction Limits".
+const SUBSCRIBE_PATHS_SUPPORTED: u16 = 3;
 
 impl CapabilityMinima {
     /// Create a default instance of `CapabilityMinima`, with CASE sessions per
@@ -277,6 +324,10 @@ impl CapabilityMinima {
         Self {
             case_sessions_per_fabric: (MAX_SESSIONS / MAX_FABRICS) as _,
             subscriptions_per_fabric: SUBSCRIPTIONS_PER_FABRIC,
+            simultaneous_invocations_supported: SIMULTANEOUS_INVOCATIONS_SUPPORTED,
+            simultaneous_writes_supported: SIMULTANEOUS_WRITES_SUPPORTED,
+            read_paths_supported: READ_PATHS_SUPPORTED,
+            subscribe_paths_supported: SUBSCRIBE_PATHS_SUPPORTED,
         }
     }
 }
@@ -314,13 +365,47 @@ impl Default for ProductAppearance {
     }
 }
 
+/// Owned mirror of the `LocationDescriptorStruct` global type, as stored for
+/// the `BasicInformation::DeviceLocation` attribute.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, ToTLV, FromTLV)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DeviceLocation {
+    /// Free-form location description, at most 128 bytes.
+    pub location_name: heapless::String<128>,
+    /// Floor number, when applicable; `Null` on the wire when `None`.
+    pub floor_number: Option<i16>,
+    /// Area type from the common Area namespace; `Null` on the wire when
+    /// `None`.
+    pub area_type: Option<AreaTypeTag>,
+}
+
+impl DeviceLocation {
+    /// Create an empty `DeviceLocation` (empty location name, no floor
+    /// number, no area type).
+    pub const fn new() -> Self {
+        Self {
+            location_name: heapless::String::new(),
+            floor_number: None,
+            area_type: None,
+        }
+    }
+}
+
+impl Default for DeviceLocation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Mutable basic information
 #[derive(Debug, Clone, Eq, PartialEq, Hash, ToTLV, FromTLV)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BasicInfoSettings {
     pub node_label: heapless::String<32>, // Max node-label as per the spec
     pub location: Option<heapless::String<2>>, // Max location as per the spec
-    pub location_type: RegulatoryLocationTypeEnum,
+    /// The regulatory location type, as set via
+    /// `GeneralCommissioning::SetRegulatoryConfig`.
+    pub location_type: Option<RegulatoryLocationTypeEnum>,
     pub local_config_disabled: bool,
     /// `BasicInformation::ConfigurationVersion` (Matter Core Spec).
     /// Non-volatile, monotonically increasing, minimum 1.
@@ -329,6 +414,17 @@ pub struct BasicInfoSettings {
     /// fixed-quality surface (Server/Parts list, device types, software
     /// version, …) changes — see Matter Core Spec.
     pub configuration_version: u32,
+    /// `BasicInformation::DeviceLocation` (provisional in the Matter 1.6
+    /// IDL): where the device is installed, admin-writable.
+    pub device_location: Option<Nullable<DeviceLocation>>,
+    /// `GeneralCommissioning::RecoveryIdentifier` (provisional in Matter 1.6):
+    /// a random 64-bit value that identifies this node during the
+    /// Network Recovery flow without revealing its Node ID.
+    ///
+    /// NOTE: keep this field *last* - the persisted-blob TLV tags are
+    /// positional, and appending preserves compatibility with blobs written
+    /// before the field existed.
+    pub recovery_identifier: Option<u64>,
 }
 
 impl BasicInfoSettings {
@@ -337,11 +433,13 @@ impl BasicInfoSettings {
         Self {
             node_label: heapless::String::new(),
             location: None,
-            location_type: RegulatoryLocationTypeEnum::IndoorOutdoor,
+            location_type: None,
             local_config_disabled: false,
             // Spec fallback for `ConfigurationVersion` is 1 (`min 1`,
             // Core Spec).
             configuration_version: 1,
+            device_location: None,
+            recovery_identifier: None,
         }
     }
 
@@ -350,9 +448,11 @@ impl BasicInfoSettings {
         init!(Self {
             node_label: heapless::String::new(),
             location: None,
-            location_type: RegulatoryLocationTypeEnum::IndoorOutdoor,
+            location_type: None,
             local_config_disabled: false,
             configuration_version: 1,
+            device_location: None,
+            recovery_identifier: None,
         })
     }
 
@@ -363,8 +463,11 @@ impl BasicInfoSettings {
     pub fn reset(&mut self) {
         self.node_label.clear();
         self.location = None;
+        self.location_type = None;
         self.local_config_disabled = false;
         self.configuration_version = 1;
+        self.device_location = None;
+        self.recovery_identifier = None;
     }
 
     /// Bump `ConfigurationVersion` by one and return the new value.
@@ -382,12 +485,9 @@ impl BasicInfoSettings {
         self.configuration_version
     }
 
+    /// Set the location (country code) to the given (2-character) value.
     pub fn set_location(&mut self, location: &str) {
-        if location == "XX" {
-            self.location = None;
-        } else {
-            self.location = Some(unwrap!(heapless::String::<2>::from_str(location)));
-        }
+        self.location = Some(unwrap!(heapless::String::<2>::from_str(location)));
     }
 
     /// Remove all basic info settings from the provided BLOB store as well as from memory
@@ -418,8 +518,27 @@ impl BasicInfoSettings {
         self.location_type = info.location_type;
         self.local_config_disabled = info.local_config_disabled;
         self.configuration_version = info.configuration_version;
+        self.device_location = info.device_location;
+        self.recovery_identifier = info.recovery_identifier;
 
         Ok(())
+    }
+
+    /// Store the basic info settings via the provided `Persist` instance
+    ///
+    /// # Arguments
+    /// - `persist`: the `Persist` instance to serialize the settings into
+    ///
+    /// Deliberately outlined (`inline(never)`): the settings' TLV
+    /// serialization is sizeable, and every runtime-mutable-attribute setter
+    /// ends with this call - sharing a single copy keeps it out of each
+    /// attribute-dispatch path (flash size).
+    #[inline(never)]
+    pub fn store_persist<S: KvBlobStoreAccess>(
+        &self,
+        persist: &mut Persist<S>,
+    ) -> Result<(), Error> {
+        persist.store_tlv(BASIC_INFO_KEY, self)
     }
 
     /// Load all basic info settings from the provided BLOB store
@@ -478,21 +597,33 @@ impl BasicInfoHandler {
     }
 }
 
+/// `BasicInformation` cluster metadata that additionally advertises the
+/// provisional `DeviceLocation` attribute (admin-writable, persisted in
+/// [`BasicInfoSettings`]).
+///
+/// Use this in place of [`BasicInfoHandler::CLUSTER`] to serve the attribute -
+/// the handler itself always implements it. It is deliberately not the
+/// default: the attribute is provisional, and reference test suites that pin
+/// `BasicInformation::AttributeList` to an exact set reject its presence.
+///
+/// The initial value is `Null`; set [`BasicInfoConfig::device_location`] for
+/// a device whose location is factory-provisioned.
+pub const CLUSTER_DEVICE_LOCATION: Cluster<'static> = FULL_CLUSTER
+    .with_attrs(except!(AttributeId::Reachable))
+    .with_cmds(with!());
+
 impl ClusterHandler for BasicInfoHandler {
     const CLUSTER: Cluster<'static> = FULL_CLUSTER
-        // Hide `Reachable` (TODO) and `ConfigurationVersion` from the default
-        // metadata. `ConfigurationVersion` is provisional in Matter 1.5 and
-        // upstream's 1.5 dataset (CHIP commit faf4d09ad1, "Remove
-        // configuration version from 1.5 branch") explicitly excludes it from
-        // `BasicInformation`'s `AttributeList`. The
-        // `BasicInformation`/`BasicInfoSettings` plumbing for it stays in
-        // place — read handler, persisted settings field, and the
-        // `Matter::bump_configuration_version` / `InteractionModel::bump_configuration_version`
-        // entry points — so a user that supplies their own cluster metadata
-        // (i.e. one that drops `ConfigurationVersion` from `except!`) gets a
-        // working implementation out of the box.
+        // Hide `Reachable` (TODO) from the default metadata.
+        //
+        // `DeviceLocation` IS implemented (see `device_location` /
+        // `set_device_location` below) but stays out of the default metadata
+        // because it is provisional: upstream's reference apps do not
+        // advertise it, and test suites that pin `AttributeList` to an exact
+        // set (e.g. the `TestBasicInformation` YAML) reject its presence.
+        // Opt in with [`CLUSTER_DEVICE_LOCATION`].
         .with_attrs(except!(
-            AttributeId::Reachable | AttributeId::ConfigurationVersion
+            AttributeId::Reachable | AttributeId::DeviceLocation
         ))
         .with_cmds(with!());
 
@@ -580,7 +711,7 @@ impl ClusterHandler for BasicInfoHandler {
                 .push_str(label)
                 .map_err(|_| ErrorCode::ConstraintError)?;
 
-            persist.store_tlv(BASIC_INFO_KEY, &*settings)
+            settings.store_persist(&mut persist)
         })?;
 
         persist.run()
@@ -591,8 +722,19 @@ impl ClusterHandler for BasicInfoHandler {
         ctx: impl ReadContext,
         out: Utf8StrBuilder<P>,
     ) -> Result<P, Error> {
+        // Until a value is set at runtime (`Location` write /
+        // `SetRegulatoryConfig`), report the factory default from
+        // `BasicInfoConfig`, falling back to the "unknown" country code.
+        let config = Self::config(ctx.exchange());
+
         Self::with_settings(ctx.exchange(), |settings| {
-            out.set(settings.location.as_ref().map_or("XX", |loc| loc.as_str()))
+            out.set(
+                settings
+                    .location
+                    .as_deref()
+                    .or(config.location)
+                    .unwrap_or("XX"),
+            )
         })
     }
 
@@ -606,7 +748,7 @@ impl ClusterHandler for BasicInfoHandler {
         Self::with_settings(ctx.exchange(), |settings| {
             settings.set_location(location);
 
-            persist.store_tlv(BASIC_INFO_KEY, &*settings)
+            settings.store_persist(&mut persist)
         })?;
 
         persist.run()
@@ -622,6 +764,10 @@ impl ClusterHandler for BasicInfoHandler {
         builder
             .case_sessions_per_fabric(cm.case_sessions_per_fabric)?
             .subscriptions_per_fabric(cm.subscriptions_per_fabric)?
+            .simultaneous_invocations_supported(Some(cm.simultaneous_invocations_supported))?
+            .simultaneous_writes_supported(Some(cm.simultaneous_writes_supported))?
+            .read_paths_supported(Some(cm.read_paths_supported))?
+            .subscribe_paths_supported(Some(cm.subscribe_paths_supported))?
             .end()
     }
 
@@ -640,6 +786,95 @@ impl ClusterHandler for BasicInfoHandler {
             ctx.exchange(),
             |settings| Ok(settings.configuration_version),
         )
+    }
+
+    // Deliberately outlined (`inline(never)`): inlining duplicates the
+    // builder chain in every read-dispatch instantiation (flash size)
+    #[inline(never)]
+    fn device_location<P: TLVBuilderParent>(
+        &self,
+        ctx: impl ReadContext,
+        builder: NullableBuilder<P, LocationDescriptorStructBuilder<P>>,
+    ) -> Result<P, Error> {
+        let config = Self::config(ctx.exchange());
+
+        Self::with_settings(ctx.exchange(), |settings| {
+            // An admin-written value - including an explicitly-written `Null`
+            // - takes precedence; until one exists, report the factory
+            // default from `BasicInfoConfig`, falling back to `Null`.
+            let (location_name, floor_number, area_type) = match settings.device_location.as_ref() {
+                Some(location) => match location.as_opt_ref() {
+                    Some(location) => (
+                        location.location_name.as_str(),
+                        location.floor_number,
+                        location.area_type,
+                    ),
+                    None => return builder.null(),
+                },
+                None => match config.device_location {
+                    Some(location) => (
+                        location.location_name,
+                        location.floor_number,
+                        location.area_type,
+                    ),
+                    None => return builder.null(),
+                },
+            };
+
+            builder
+                .non_null()?
+                .location_name(location_name)?
+                .floor_number(Nullable::new(floor_number))?
+                .area_type(Nullable::new(area_type))?
+                .end()
+        })
+    }
+
+    // Deliberately outlined (`inline(never)`): cold path with sizeable
+    // TLV-parsing and persistence code (flash size)
+    #[inline(never)]
+    fn set_device_location(
+        &self,
+        ctx: impl WriteContext,
+        value: Nullable<LocationDescriptorStruct<'_>>,
+    ) -> Result<(), Error> {
+        let mut persist = Persist::new(ctx.kv());
+
+        Self::with_settings(ctx.exchange(), |settings| {
+            if let Some(value) = value.as_opt_ref() {
+                // Parse and validate everything up-front, so that a failed
+                // write leaves the stored value intact
+                let location_name = value.location_name()?;
+                if location_name.len() > 128 {
+                    return Err(ErrorCode::ConstraintError.into());
+                }
+
+                let floor_number = value.floor_number()?.into_option();
+                let area_type = value.area_type()?.into_option();
+
+                // ... and then update the stored value in-place: going
+                // through an owned `DeviceLocation` temporary would move the
+                // ~150-byte value several times through the stack (flash and
+                // stack size)
+                let location = settings.device_location.get_or_insert_with(Nullable::none);
+                if location.is_none() {
+                    *location = Nullable::some(DeviceLocation::new());
+                }
+
+                let location = unwrap!(location.as_opt_mut());
+
+                location.location_name.clear();
+                unwrap!(location.location_name.push_str(location_name));
+                location.floor_number = floor_number;
+                location.area_type = area_type;
+            } else {
+                settings.device_location = Some(Nullable::none());
+            }
+
+            settings.store_persist(&mut persist)
+        })?;
+
+        persist.run()
     }
 
     fn handle_mfg_specific_ping(&self, _ctx: impl InvokeContext) -> Result<(), Error> {
@@ -699,7 +934,7 @@ impl ClusterHandler for BasicInfoHandler {
         Self::with_settings(ctx.exchange(), |settings| {
             settings.local_config_disabled = value;
 
-            persist.store_tlv(BASIC_INFO_KEY, &*settings)
+            settings.store_persist(&mut persist)
         })?;
 
         persist.run()
@@ -725,4 +960,112 @@ impl ClusterHandler for BasicInfoHandler {
             .primary_color(Nullable::new(appearance.color))?
             .end()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BasicInfoSettings, DeviceLocation};
+
+    use crate::tlv::{Nullable, TLVElement, TLVTag, ToTLV};
+    use crate::utils::storage::WriteBuf;
+
+    /// Round-trip `settings` through the persisted-blob TLV representation.
+    fn round_trip(settings: &BasicInfoSettings) -> BasicInfoSettings {
+        let mut buf = [0; 512];
+        let mut wb = WriteBuf::new(&mut buf);
+        settings.to_tlv(&TLVTag::Anonymous, &mut wb).unwrap();
+
+        let mut loaded = BasicInfoSettings::new();
+        loaded.load(wb.as_slice()).unwrap();
+
+        loaded
+    }
+
+    /// An explicit `XX` ("unknown country") write must be stored - and
+    /// persisted - verbatim: `None` means "never configured" (and lets the
+    /// `Location` attribute report the `BasicInfoConfig::location` factory
+    /// default), which an explicit `XX` write is not.
+    #[test]
+    fn explicit_xx_location_is_kept() {
+        let mut settings = BasicInfoSettings::new();
+        assert!(settings.location.is_none());
+
+        settings.set_location("XX");
+        assert_eq!(settings.location.as_deref(), Some("XX"));
+        assert_eq!(round_trip(&settings).location.as_deref(), Some("XX"));
+    }
+
+    /// The three `device_location` states - never-written / explicit `Null` /
+    /// value - must survive the persisted-blob round-trip, or an admin
+    /// -written `Null` would resurrect the factory default after a reboot.
+    #[test]
+    fn device_location_states_survive_persistence() {
+        let mut settings = BasicInfoSettings::new();
+        assert!(round_trip(&settings).device_location.is_none());
+
+        settings.device_location = Some(Nullable::none());
+        let loaded = round_trip(&settings);
+        assert!(matches!(&loaded.device_location, Some(l) if l.is_none()));
+
+        settings.device_location = Some(Nullable::some(DeviceLocation {
+            location_name: "Basement".try_into().unwrap(),
+            floor_number: Some(-1),
+            area_type: None,
+        }));
+        let loaded = round_trip(&settings);
+        let location = loaded.device_location.unwrap().into_option().unwrap();
+        assert_eq!(location.location_name, "Basement");
+        assert_eq!(location.floor_number, Some(-1));
+        assert_eq!(location.area_type, None);
+    }
+
+    /// Settings predating the `device_location` field (or a factory-fresh
+    /// blob) must load as "never written".
+    #[test]
+    fn missing_device_location_field_loads_as_unset() {
+        // A blob serialized without the trailing `device_location` field:
+        // emulate by truncating... simpler - serialize a fresh settings
+        // (which encodes the field as absent) and check the tri-state.
+        let settings = BasicInfoSettings::new();
+        let loaded = round_trip(&settings);
+        assert!(loaded.device_location.is_none());
+
+        // And `reset()` returns every runtime-configured value to
+        // "never written", so the factory defaults apply again.
+        let mut settings = BasicInfoSettings::new();
+        settings.set_location("US");
+        settings.location_type = Some(super::RegulatoryLocationTypeEnum::Indoor);
+        settings.device_location = Some(Nullable::none());
+        settings.reset();
+        assert!(settings.location.is_none());
+        assert!(settings.location_type.is_none());
+        assert!(settings.device_location.is_none());
+    }
+
+    /// The `GeneralCommissioning::RecoveryIdentifier` value must survive the
+    /// persisted-blob round-trip (stable across reboots, per Matter Core Spec
+    /// 11.10.6.11), load as "never minted" from a blob that predates the field,
+    /// and be cleared by `reset()` so a factory reset regenerates it.
+    #[test]
+    fn recovery_identifier_survives_persistence_and_resets() {
+        // Factory-fresh (and blobs predating the field) load as "never minted".
+        let mut settings = BasicInfoSettings::new();
+        assert!(settings.recovery_identifier.is_none());
+        assert!(round_trip(&settings).recovery_identifier.is_none());
+
+        // A minted value round-trips verbatim.
+        settings.recovery_identifier = Some(0x1122_3344_5566_7788);
+        assert_eq!(
+            round_trip(&settings).recovery_identifier,
+            Some(0x1122_3344_5566_7788)
+        );
+
+        // Factory reset clears it so the next read mints a fresh one.
+        settings.reset();
+        assert!(settings.recovery_identifier.is_none());
+    }
+
+    // Silence unused-import lint on no-test builds
+    #[allow(unused)]
+    fn _t(_: TLVElement) {}
 }

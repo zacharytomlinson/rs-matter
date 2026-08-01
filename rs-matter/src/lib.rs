@@ -34,6 +34,7 @@ use crate::dm::clusters::basic_info::{
     self, BasicInfoConfig, BasicInfoSettings, FULL_CLUSTER as BASIC_INFO_CLUSTER,
 };
 use crate::dm::clusters::dev_att::DeviceAttestation;
+use crate::dm::clusters::icd_mgmt::OperatingModeEnum;
 use crate::dm::clusters::time_sync::Rtc;
 use crate::dm::endpoints::ROOT_ENDPOINT_ID;
 use crate::dm::AttrChangeNotifier;
@@ -44,9 +45,11 @@ use crate::pairing::qr::{
     no_optional_data, CommFlowType, NoOptionalData, Qr, QrPayload, QrTextType,
 };
 use crate::pairing::DiscoveryCapabilities;
-use crate::persist::{KvBlobStore, KvBlobStoreAccess, Persist, BASIC_INFO_KEY};
+use crate::persist::{KvBlobStore, KvBlobStoreAccess, Persist};
+#[cfg(feature = "case-resumption")]
+use crate::sc::case::ResumableSessions;
 use crate::sc::pase::spake2p::{Spake2pVerifierPassword, SPAKE2P_VERIFIER_SALT_ZEROED};
-use crate::sc::pase::Pase;
+use crate::sc::pase::{CommWindowState, Pase};
 use crate::transport::network::MatterLocalService;
 use crate::transport::network::{NetworkMulticast, NetworkReceive, NetworkSend};
 use crate::transport::session::Sessions;
@@ -142,6 +145,11 @@ pub struct Matter<'a> {
     dev_att: &'a dyn DeviceAttestation,
     /// The port number on which the Matter stack will listen for incoming connections
     port: u16,
+    /// The Groupcast testing-mode bridge - shared between the transport RX
+    /// path, the Interaction Model's invoke processing and the Groupcast
+    /// cluster handler. See `dm::clusters::groupcast::TestingBridge`.
+    #[cfg(feature = "groups")]
+    groupcast_testing: crate::dm::clusters::groupcast::TestingBridge,
     /// The scratch buffer used by the key-value persistence machinery for
     /// (de)serializing BLOBs. Behind a blocking mutex so [`Matter::kv`] can
     /// recombine it with the user's raw [`KvBlobStore`](crate::persist::KvBlobStore)
@@ -176,6 +184,8 @@ impl<'a> Matter<'a> {
             dev_comm,
             dev_att,
             port,
+            #[cfg(feature = "groups")]
+            groupcast_testing: crate::dm::clusters::groupcast::TestingBridge::new(),
             kv_buf: Mutex::new(RefCell::new([0; crate::persist::KV_BUF_SIZE])),
         }
     }
@@ -196,17 +206,38 @@ impl<'a> Matter<'a> {
         dev_att: &'a dyn DeviceAttestation,
         port: u16,
     ) -> impl Init<Self> {
-        init!(
-            Self {
-                state <- Mutex::init(RefCell::init(MatterState::init())),
-                transport <- Transport::init(dev_det),
-                dev_det,
-                dev_comm,
-                dev_att,
-                port,
-                kv_buf <- Mutex::init(RefCell::init(crate::utils::init::zeroed())),
-            }
-        )
+        // Two variants because the `init!` macro does not accept `#[cfg]`
+        // on fields
+        #[cfg(feature = "groups")]
+        {
+            init!(
+                Self {
+                    state <- Mutex::init(RefCell::init(MatterState::init())),
+                    transport <- Transport::init(dev_det),
+                    dev_det,
+                    dev_comm,
+                    dev_att,
+                    port,
+                    groupcast_testing <- crate::dm::clusters::groupcast::TestingBridge::init(),
+                    kv_buf <- Mutex::init(RefCell::init(crate::utils::init::zeroed())),
+                }
+            )
+        }
+
+        #[cfg(not(feature = "groups"))]
+        {
+            init!(
+                Self {
+                    state <- Mutex::init(RefCell::init(MatterState::init())),
+                    transport <- Transport::init(dev_det),
+                    dev_det,
+                    dev_comm,
+                    dev_att,
+                    port,
+                    kv_buf <- Mutex::init(RefCell::init(crate::utils::init::zeroed())),
+                }
+            )
+        }
     }
 
     pub fn dev_det(&self) -> &BasicInfoConfig<'_> {
@@ -225,6 +256,26 @@ impl<'a> Matter<'a> {
         self.port
     }
 
+    /// The ICD operating mode to advertise in the operational `ICD` DNS-SD TXT
+    /// key, or `None` when the device is not a Long-Idle-Time ICD.
+    pub fn icd_mode(&self) -> Option<OperatingModeEnum> {
+        self.with_state(|state| state.icd_mode)
+    }
+
+    /// Set the ICD operating mode advertised in mDNS and, if it changed, signal
+    /// the mDNS layer to re-publish.
+    pub fn set_icd_mode(&self, mode: Option<OperatingModeEnum>) {
+        let changed = self.with_state(|state| {
+            let changed = state.icd_mode != mode;
+            state.icd_mode = mode;
+            changed
+        });
+
+        if changed {
+            self.transport.notify_mdns_changed();
+        }
+    }
+
     /// Combine a user-provided raw [`KvBlobStore`] with the scratch buffer owned
     /// by this `Matter` object to obtain a full [`KvBlobStoreAccess`].
     ///
@@ -232,8 +283,7 @@ impl<'a> Matter<'a> {
     /// raw store (sync `load`/`store`/`remove`) and gets back an access object
     /// that recombines it with `Matter`'s feature-sized scratch buffer (see
     /// [`KV_BUF_SIZE`](crate::persist::KV_BUF_SIZE)). The returned value is then
-    /// lent (by `&`) to [`Matter::load_persist`], [`Matter::reset_persist`],
-    /// [`InteractionModelState::load_persist`](crate::im::InteractionModelState::load_persist)
+    /// lent (by `&`) to [`Matter::startup`], [`Matter::factory_reset`]
     /// and [`InteractionModel::new`](crate::im::InteractionModel::new).
     ///
     /// # Arguments
@@ -362,19 +412,22 @@ impl<'a> Matter<'a> {
         Ok(payload)
     }
 
-    /// Return `true` if there is at least one commissioned fabric
-    //
-    // TODO:
-    // The implementation of this method needs to change in future,
-    // because the current implementation does not really track whether
-    // `CommissioningComplete` had been actually received for the fabric.
-    //
-    // The fabric is created once we receive `AddNoc`, but that's just
-    // not enough. The fabric should NOT be considered commissioned until
-    // after we receive `CommissioningComplete` on behalf of a Case session
-    // for the fabric in question.
-    pub fn is_commissioned(&self) -> bool {
-        self.with_state(|state| state.fabrics.iter().count() > 0)
+    /// Return `true` if there is at least one fabric.
+    ///
+    /// Note that this is emphatically *not* "the device is commissioned": a fabric is created
+    /// as soon as `AddNOC` is received, which is well before the commissioner has established a
+    /// CASE session over the operational network and sent `CommissioningComplete`. Code that
+    /// needs to know whether commissioning is still in progress should use
+    /// [`Matter::is_comm_window_open`] instead, as the commissioning window stays open for exactly
+    /// that long.
+    pub fn has_fabrics(&self) -> bool {
+        self.with_state(|state| state.fabrics.iter().next().is_some())
+    }
+
+    /// Return the state of the commissioning window - whether one is open, and if so who
+    /// opened it. See [`CommWindowState`] for what the answer is good for.
+    pub fn comm_window_state(&self) -> CommWindowState {
+        self.with_state(|state| state.pase.comm_window_state())
     }
 
     /// Open a basic commissioning window
@@ -471,7 +524,7 @@ impl<'a> Matter<'a> {
         let new_version = self.with_state(|state| {
             let new_version = state.basic_info_settings.bump_configuration_version();
 
-            persist.store_tlv(BASIC_INFO_KEY, &state.basic_info_settings)?;
+            state.basic_info_settings.store_persist(&mut persist)?;
 
             notify.notify_attr_changed(
                 ROOT_ENDPOINT_ID,
@@ -529,6 +582,12 @@ impl<'a> Matter<'a> {
         })
     }
 
+    /// Return the Groupcast testing-mode bridge.
+    #[cfg(feature = "groups")]
+    pub(crate) fn groupcast_testing(&self) -> &crate::dm::clusters::groupcast::TestingBridge {
+        &self.groupcast_testing
+    }
+
     /// Access the Real-Time-clock by invoking a closure with a mutable reference to it.
     pub fn with_rtc<F, R>(&self, f: F) -> R
     where
@@ -547,18 +606,26 @@ impl<'a> Matter<'a> {
         })
     }
 
-    /// Reset the Matter persistable state by removing all fabrics and resetting basic info settings
+    /// Factory-reset the `Matter` persistable state by removing all fabrics and
+    /// resetting the basic info settings, the RTC state and (if compiled in) the
+    /// CASE resumption cache - both in-memory and in the provided KV store.
+    ///
+    /// The counterpart of [`Matter::startup`]. Call when the node is
+    /// factory-reset, alongside
+    /// [`InteractionModel::factory_reset`](crate::im::InteractionModel::factory_reset).
     ///
     /// Arguments:
     /// - `kv`: The key-value store access (obtained via [`Matter::kv`]) to remove the fabrics
     ///   and basic info settings from. Provides both the store and the scratch buffer.
-    pub async fn reset_persist<K: KvBlobStoreAccess>(&self, kv: K) -> Result<(), Error> {
+    pub fn factory_reset<K: KvBlobStoreAccess>(&self, kv: K) -> Result<(), Error> {
         self.with_state(|state| {
             // The KV ops are sync, so do them all inside a single `access` closure.
             kv.access(|mut store, buf| {
                 state.fabrics.reset_persist(&mut store, buf)?;
                 state.basic_info_settings.reset_persist(&mut store, buf)?;
                 state.rtc.reset_persist(&mut store, buf)?;
+                #[cfg(feature = "case-resumption")]
+                state.resumption.reset_persist(&mut store, buf)?;
 
                 Ok::<_, Error>(())
             })
@@ -569,18 +636,26 @@ impl<'a> Matter<'a> {
         Ok(())
     }
 
-    /// Load fabrics from the given data
+    /// Re-hydrate the `Matter` persistable state - the fabrics, the basic info
+    /// settings, the RTC state and (if compiled in) the CASE resumption cache -
+    /// from the provided KV store.
+    ///
+    /// Call once at startup, before the transport starts serving traffic. The
+    /// Data-Model counterpart is
+    /// [`InteractionModel::startup`](crate::im::InteractionModel::startup).
     ///
     /// Arguments:
     /// - `kv`: The key-value store access (obtained via [`Matter::kv`]) to load the fabrics
     ///   and basic info settings from. Provides both the store and the scratch buffer.
-    pub async fn load_persist<K: KvBlobStoreAccess>(&self, kv: K) -> Result<(), Error> {
+    pub fn startup<K: KvBlobStoreAccess>(&self, kv: K) -> Result<(), Error> {
         self.with_state(|state| {
             // The KV ops are sync, so do them all inside a single `access` closure.
             kv.access(|mut store, buf| {
                 state.fabrics.load_persist(&mut store, buf)?;
                 state.basic_info_settings.load_persist(&mut store, buf)?;
                 state.rtc.load_persist(&mut store, buf)?;
+                #[cfg(feature = "case-resumption")]
+                state.resumption.load_persist(&mut store, buf)?;
 
                 Ok::<_, Error>(())
             })
@@ -589,6 +664,61 @@ impl<'a> Matter<'a> {
         self.transport().notify_mdns_changed();
 
         Ok(())
+    }
+
+    /// Background task that flushes the CASE session resumption cache
+    /// to persistent storage whenever it is mutated.
+    ///
+    /// The task waits for a mutation event fired by the CASE handshake
+    /// paths (both full handshake and resumption), sleeps for
+    /// `min_interval` so a burst of handshakes coalesces into one
+    /// write, and then serialises the current cache to `kv` under
+    /// [`crate::persist::CASE_RESUMPTION_KEY`].
+    ///
+    /// `min_interval` therefore doubles as (a) a burst-coalescing
+    /// debounce and (b) a hard lower bound on the time between two
+    /// consecutive persists — a mutation‑storm cannot drive more than
+    /// one write per `min_interval` regardless of arrival rate. Pick
+    /// something appropriate for the underlying medium:
+    ///
+    /// - POSIX / dev builds: anything from a few hundred ms upwards is
+    ///   fine; `Duration::from_millis(500)` matches the pre‑existing
+    ///   hard‑coded behaviour.
+    /// - MCU firmwares writing to internal flash: prefer tens of
+    ///   seconds (e.g. `Duration::from_secs(30)`) so a
+    ///   commissioner-driven wave of CASE handshakes doesn't churn the
+    ///   flash write endurance budget. The cache is a soft cache — a
+    ///   power cut that loses the most recent entry only forces a
+    ///   full CASE handshake the next time the peer connects, which
+    ///   is the same fallback any resumption failure produces.
+    ///
+    /// Intended to be spawned alongside [`Matter::run`], for example
+    /// via `embassy_futures::select` or a dedicated executor task. It
+    /// never returns on the happy path — a `Result` is only produced
+    /// if the KV backend errors.
+    ///
+    /// # Arguments
+    /// - `kv`: The key-value store access (obtained via [`Matter::kv`])
+    ///   used to persist the cache. Provides both the store and the
+    ///   scratch buffer.
+    /// - `min_interval`: Minimum time between two consecutive persists
+    ///   (see above).
+    #[cfg(feature = "case-resumption")]
+    pub async fn run_persist_resumption<K: KvBlobStoreAccess>(
+        &self,
+        kv: K,
+        min_interval: embassy_time::Duration,
+    ) -> Result<(), Error> {
+        loop {
+            self.transport().wait_resumption_dirty().await;
+            embassy_time::Timer::after(min_interval).await;
+
+            self.with_state(|state| {
+                kv.access(|mut store, buf| state.resumption.store_persist(&mut store, buf))
+            })?;
+
+            debug!("CASE session resumption cache persisted");
+        }
     }
 
     /// Invoke the given closure for each currently published Matter mDNS service.
@@ -634,6 +764,11 @@ pub struct MatterState {
     pub fabrics: Fabrics,
     /// All sessions
     sessions: Sessions,
+    /// CASE session resumption cache
+    ///
+    /// Public for unit tests
+    #[cfg(feature = "case-resumption")]
+    pub resumption: ResumableSessions,
     /// The PASE session state
     pase: Pase,
     /// The Failsafe state
@@ -642,6 +777,9 @@ pub struct MatterState {
     basic_info_settings: BasicInfoSettings,
     /// Real Time Clock state and Last-Known-Good UTC Time tracking (Matter Core spec).
     rtc: Rtc,
+    /// The ICD operating mode advertised in the operational `ICD` DNS-SD TXT key.
+    /// The ICD Management handler keeps this in sync with its registration set.
+    icd_mode: Option<OperatingModeEnum>,
 }
 
 impl MatterState {
@@ -651,14 +789,35 @@ impl MatterState {
         Self {
             fabrics: Fabrics::new(),
             sessions: Sessions::new(),
+            #[cfg(feature = "case-resumption")]
+            resumption: ResumableSessions::new(),
             pase: Pase::new(),
             failsafe: FailSafe::new(),
             basic_info_settings: BasicInfoSettings::new(),
             rtc: Rtc::new(),
+            icd_mode: None,
         }
     }
 
     /// Return an in-place initializer for MatterState
+    // NOTE: `init!` (pinned-init) rejects `#[cfg]` on its fields, so the
+    // `case-resumption` field forces two full variants of this initializer.
+    #[cfg(feature = "case-resumption")]
+    fn init() -> impl Init<Self> {
+        init!(Self {
+            fabrics <- Fabrics::init(),
+            sessions <- Sessions::init(),
+            resumption <- crate::sc::case::ResumableSessions::init(),
+            pase <- Pase::init(),
+            failsafe <- FailSafe::init(),
+            basic_info_settings <- BasicInfoSettings::init(),
+            rtc <- Rtc::init(),
+            icd_mode: None,
+        })
+    }
+
+    /// Return an in-place initializer for MatterState
+    #[cfg(not(feature = "case-resumption"))]
     fn init() -> impl Init<Self> {
         init!(Self {
             fabrics <- Fabrics::init(),
@@ -667,6 +826,7 @@ impl MatterState {
             failsafe <- FailSafe::init(),
             basic_info_settings <- BasicInfoSettings::init(),
             rtc <- Rtc::init(),
+            icd_mode: None,
         })
     }
 }

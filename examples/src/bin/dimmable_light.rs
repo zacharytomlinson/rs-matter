@@ -78,15 +78,13 @@ fn main() -> Result<(), Error> {
     let buffers: MatterBuffers = MatterBuffers::new();
 
     // Create the data model state (subscriptions, events, network store).
-    let mut state: EthInteractionModelState =
-        EthInteractionModelState::new(EthNetwork::new_default());
+    let state: EthInteractionModelState = EthInteractionModelState::new(EthNetwork::new_default());
 
     // Bind the KV access object (the KV scratch buffer lives in `Matter`).
     let kv = matter.kv(store);
 
-    // Re-hydrate the `Matter` instance and the data model state (event-number epoch).
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
-    futures_lite::future::block_on(state.load_persist(&kv))?;
+    // Re-hydrate the `Matter` instance (fabrics, basic info, RTC).
+    matter.startup(&kv)?;
 
     // Create the crypto instance
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
@@ -123,6 +121,10 @@ fn main() -> Result<(), Error> {
         &state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state and deliver the `Startup` lifecycle op to all cluster handlers.
+    futures_lite::future::block_on(im.startup())?;
+
     // Create a default responder capable of handling up to 3 subscriptions
     // All other subscription requests will be turned down with "resource exhausted"
     let responder = DefaultResponder::new(&im);
@@ -144,7 +146,7 @@ fn main() -> Result<(), Error> {
     // even if the device is already commissioned
     matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         // If the device is not commissioned yet, print the QR code to the console
         // and enable basic commissioning
 

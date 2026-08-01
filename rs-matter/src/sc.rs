@@ -35,6 +35,9 @@ use pase::PaseResponder;
 
 pub mod busy;
 pub mod case;
+pub mod checkin;
+#[cfg(feature = "groups")]
+pub mod mcsp;
 pub mod pase;
 
 /* Interaction Model ID as per the Matter Spec */
@@ -56,6 +59,7 @@ pub enum OpCode {
     CASESigma3 = 0x32,
     CASESigma2Resume = 0x33,
     StatusReport = 0x40,
+    CheckIn = 0x50,
 }
 
 impl OpCode {
@@ -63,7 +67,9 @@ impl OpCode {
         MessageMeta {
             proto_id: PROTO_ID_SECURE_CHANNEL,
             proto_opcode: *self as u8,
-            reliable: !matches!(self, Self::MRPStandAloneAck),
+            // Check-In is a fire-and-forget notification sent without MRP, like
+            // the standalone ack.
+            reliable: !matches!(self, Self::MRPStandAloneAck | Self::CheckIn),
         }
     }
 
@@ -74,6 +80,7 @@ impl OpCode {
                 | Self::StatusReport
                 | Self::MsgCounterSyncReq
                 | Self::MsgCounterSyncResp
+                | Self::CheckIn
         )
     }
 }
@@ -170,7 +177,7 @@ pub enum GeneralCode {
 
 /// Represents the session parameters
 /// that might present in a "PBKDFParamRequest"/"PBKDFParamResponse" or "CASE-Sigma1"/"CASE-Sigma2" message
-#[derive(Default, FromTLV, ToTLV, Debug)]
+#[derive(Default, Clone, FromTLV, ToTLV, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[tlvargs(start = 1)]
 pub(crate) struct SessionParameters {
@@ -224,16 +231,76 @@ impl<'a> StatusReport<'a> {
     }
 }
 
-/// Handle messages related to the Secure Channel
-pub struct SecureChannel<'a, C> {
-    crypto: C,
-    notify: &'a dyn AttrChangeNotifier,
+/// An extension point for the [`SecureChannel`] handler, letting a controller
+/// react to the Secure Channel messages that the accessory role only drops:
+/// incoming Check-In notifications and unsolicited Message Counter Sync
+/// responses.
+///
+/// Both methods default to dropping the message (matching the accessory role),
+/// so `()` is a valid no-op handler. A controller overrides the verb(s) it cares
+/// about; the handler receives the [`Exchange`] to read the message from.
+pub trait AsyncScHandler {
+    /// Handle an incoming Check-In message (Secure Channel opcode `CheckIn`).
+    async fn check_in(&self, _exchange: Exchange<'_>) -> Result<(), Error> {
+        warn!("Check-In: Unexpected Check-In message received; dropping");
+        Ok(())
+    }
+
+    /// Handle an unsolicited Message Counter Sync response
+    /// (opcode `MsgCounterSyncResp`).
+    async fn mcsp_resp(&self, _exchange: Exchange<'_>) -> Result<(), Error> {
+        warn!("MCSP: Unsolicited MsgCounterSyncResp received; dropping");
+        Ok(())
+    }
 }
 
-impl<'a, C: Crypto> SecureChannel<'a, C> {
+impl AsyncScHandler for () {}
+
+impl<T> AsyncScHandler for &T
+where
+    T: AsyncScHandler,
+{
+    async fn check_in(&self, exchange: Exchange<'_>) -> Result<(), Error> {
+        T::check_in(self, exchange).await
+    }
+
+    async fn mcsp_resp(&self, exchange: Exchange<'_>) -> Result<(), Error> {
+        T::mcsp_resp(self, exchange).await
+    }
+}
+
+/// Handle messages related to the Secure Channel
+pub struct SecureChannel<'a, C, H = ()> {
+    crypto: C,
+    notify: &'a dyn AttrChangeNotifier,
+    handler: H,
+}
+
+impl<'a, C: Crypto> SecureChannel<'a, C, ()> {
     #[inline(always)]
     pub const fn new(crypto: C, notify: &'a dyn AttrChangeNotifier) -> Self {
-        Self { crypto, notify }
+        Self {
+            crypto,
+            notify,
+            handler: (),
+        }
+    }
+}
+
+impl<'a, C: Crypto, H: AsyncScHandler> SecureChannel<'a, C, H> {
+    /// Like [`new`](Self::new) but with a controller-side [`AsyncScHandler`] that
+    /// receives incoming Check-In / MCSP-response messages instead of dropping them.
+    #[inline(always)]
+    pub const fn new_with_handler(
+        crypto: C,
+        notify: &'a dyn AttrChangeNotifier,
+        handler: H,
+    ) -> Self {
+        Self {
+            crypto,
+            notify,
+            handler,
+        }
     }
 
     pub async fn handle(&self, mut exchange: Exchange<'_>) -> Result<(), Error> {
@@ -250,14 +317,30 @@ impl<'a, C: Crypto> SecureChannel<'a, C> {
             OpCode::PBKDFParamRequest => {
                 let mut pase = MaybeUninit::uninit(); // TODO LARGE BUFFER
                 pase.init_with(PaseResponder::init(&self.crypto, self.notify))
-                    .handle(&mut exchange)
+                    .handle(exchange)
                     .await
             }
             OpCode::CASESigma1 => {
                 let mut case = MaybeUninit::uninit(); // TODO LARGE BUFFER
                 case.init_with(CaseResponder::init(&self.crypto))
-                    .handle(&mut exchange)
+                    .handle(exchange)
                     .await
+            }
+            #[cfg(feature = "groups")]
+            OpCode::MsgCounterSyncReq => {
+                // The receive path has already checked this landed on a
+                // group session with a destination matching one of our
+                // fabric node ids.
+                mcsp::respond(&self.crypto, exchange).await
+            }
+            OpCode::MsgCounterSyncResp => {
+                // Unsolicited in the accessory role; a controller may hook it.
+                self.handler.mcsp_resp(exchange).await
+            }
+            OpCode::CheckIn => {
+                // Unexpected in the accessory role (we are a Check-In *server*);
+                // a controller may hook it to receive Check-In notifications.
+                self.handler.check_in(exchange).await
             }
             opcode => {
                 error!("Invalid opcode: {:?}", opcode);
@@ -267,9 +350,29 @@ impl<'a, C: Crypto> SecureChannel<'a, C> {
     }
 }
 
-impl<C: Crypto> ExchangeHandler for SecureChannel<'_, C> {
+impl<C: Crypto, H: AsyncScHandler> ExchangeHandler for SecureChannel<'_, C, H> {
     fn handle(&self, exchange: Exchange<'_>) -> impl Future<Output = Result<(), Error>> {
         SecureChannel::handle(self, exchange)
+    }
+}
+
+/// Check the opcode of the received message like [`check_opcode`], additionally
+/// reporting a mismatch to the peer with a `StatusReport(FAILURE, INVALID_PARAMETER)`
+/// before bailing out with an error.
+async fn expect_opcode(exchange: &mut Exchange<'_>, opcode: OpCode) -> Result<(), Error> {
+    let result = check_opcode(exchange, opcode);
+
+    if let Err(err) = result {
+        if !exchange.rx()?.meta().is_sc_status() {
+            // Best-effort: the handshake has failed regardless of whether the
+            // report makes it to the peer, and the opcode mismatch is the more
+            // informative error to propagate.
+            let _ = complete_with_status(exchange, SCStatusCodes::InvalidParameter, &[]).await;
+        }
+
+        Err(err)
+    } else {
+        Ok(())
     }
 }
 

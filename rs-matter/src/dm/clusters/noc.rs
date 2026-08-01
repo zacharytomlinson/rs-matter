@@ -495,6 +495,9 @@ impl ClusterHandler for NocHandler {
         // for the auto-created admin ACL entry *after* the failsafe-armed
         // closure unwinds successfully (Matter Core spec).
         let mut admin_acl_entry: Option<AclEntry> = None;
+        // Set by the rollback scopeguard; the `LifecycleOp::FabricRemoval`
+        // broadcast happens below, once the state lock is released.
+        let rolled_back_fab_idx = Cell::new(None);
 
         let buf = response.writer().available_space();
 
@@ -532,6 +535,8 @@ impl ClusterHandler for NocHandler {
                         unwrap!(state.fabrics.remove(fab_idx));
 
                         notify_mdns();
+
+                        rolled_back_fab_idx.set(Some(fab_idx));
                     }
                 });
 
@@ -545,7 +550,17 @@ impl ClusterHandler for NocHandler {
 
                 Ok(())
             },
-        ))?;
+        ));
+
+        // Broadcast `LifecycleOp::FabricRemoval` for a fabric the rollback
+        // scopeguard just removed - on both the mapped-status and the
+        // propagated-error paths. Outside `with_state`, since the broadcast
+        // runs the handlers inline.
+        if let Some(fab_idx) = rolled_back_fab_idx.get() {
+            ctx.notify_fabric_removed(fab_idx);
+        }
+
+        let status = status?;
 
         // AddNOC mutates NOCs, Fabrics, CommissionedFabrics, TrustedRootCerts, etc.
         ctx.notify_own_cluster_changed();
@@ -697,8 +712,23 @@ impl ClusterHandler for NocHandler {
                 // If `expire_sess_id` is Some, the session will be expired instead of removed.
                 state.sessions.remove_for_fabric(fab_idx, expire_sess_id);
 
+                // Drop any CASE session resumption records that were
+                // scoped to this fabric so a subsequent CASE handshake
+                // to any peer that used to belong to it starts fresh.
+                #[cfg(feature = "case-resumption")]
+                state.resumption.remove_for_fabric(fab_idx);
+
                 // Notify that a session was removed
                 ctx.exchange().matter().transport().notify_session_removed();
+
+                // The resumption cache was just mutated — wake the
+                // background persist task so the on-disk copy sheds
+                // the removed fabric's records too.
+                #[cfg(feature = "case-resumption")]
+                ctx.exchange()
+                    .matter()
+                    .transport()
+                    .notify_resumption_dirty();
 
                 // Notify that our mDNS records might have changed
                 notify_mdns();
@@ -740,6 +770,32 @@ impl ClusterHandler for NocHandler {
         })?;
 
         persist.run()?;
+
+        if matches!(status, NodeOperationalCertStatusEnum::OK) {
+            // Matter Core spec: the node emits `BasicInformation::Leave` for a
+            // fabric that is about to be removed. Emitted through the generic
+            // cross-cluster path (this is the NOC handler, the event belongs
+            // to BasicInformation on EP0) - `TC_BINFO_2_2` step 5 reads it and
+            // checks its `fabricIndex` matches the fabric just removed.
+            //
+            // Best-effort: a missing diagnostic event must not fail the
+            // (already-committed) fabric removal.
+            let emitted = crate::dm::clusters::decl::basic_information::Leave::emit_for(
+                &ctx,
+                ROOT_ENDPOINT_ID,
+                |event| event.fabric_index(fab_idx.get())?.end(),
+            );
+
+            if let Err(e) = emitted {
+                warn!("Failed to emit the Leave event: {:?}", e);
+            }
+
+            // Broadcast `LifecycleOp::FabricRemoval`, so handlers owning
+            // fabric-scoped state outside the fabric table (bindings, scenes,
+            // ...) drop the removed fabric's entries. Outside `with_state`,
+            // since the broadcast runs the handlers inline.
+            ctx.notify_fabric_removed(fab_idx);
+        }
 
         // RemoveFabric mutates NOCs, Fabrics, CommissionedFabrics, TrustedRootCerts
         ctx.notify_own_cluster_changed();

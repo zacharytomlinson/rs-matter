@@ -64,7 +64,7 @@ use rs_matter::error::Error;
 use rs_matter::im::{EthInteractionModelState, InteractionModel};
 use rs_matter::pairing::qr::QrTextType;
 use rs_matter::pairing::DiscoveryCapabilities;
-use rs_matter::persist::{DirKvBlobStore, KvBlobStoreAccess};
+use rs_matter::persist::DirKvBlobStore;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::transport::exchange::MatterBuffers;
@@ -106,8 +106,7 @@ fn main() -> Result<(), Error> {
     // press events), so - unlike the examples that use `NoEvents` - the default
     // state carries a real (non-zero) event queue that holds them until
     // subscribers read them.
-    let mut state: EthInteractionModelState =
-        EthInteractionModelState::new(EthNetwork::new_default());
+    let state: EthInteractionModelState = EthInteractionModelState::new(EthNetwork::new_default());
 
     // The Binding registry (the switch's address book), loaded from persistence.
     let bindings = Bindings::<MAX_BINDINGS>::new();
@@ -115,10 +114,8 @@ fn main() -> Result<(), Error> {
     // Bind the KV access object (the KV scratch buffer lives in `Matter`).
     let kv = matter.kv(store);
 
-    // Re-hydrate persisted state.
-    futures_lite::future::block_on(matter.load_persist(&kv))?;
-    kv.access(|store, buf| futures_lite::future::block_on(bindings.load_persist(store, buf)))?;
-    futures_lite::future::block_on(state.load_persist(&kv))?;
+    // Re-hydrate the `Matter` instance (fabrics, ACLs, basic info).
+    matter.startup(&kv)?;
 
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
     let rand = crypto.rand()?;
@@ -132,6 +129,11 @@ fn main() -> Result<(), Error> {
         &state,
     );
 
+    // Bring the Data Model to its operational state: re-hydrate its persisted
+    // state (events epoch, network store) and deliver the `Startup` lifecycle op
+    // to all cluster handlers (here notably: the Binding registry).
+    futures_lite::future::block_on(im.startup())?;
+
     let responder = rs_matter::respond::DefaultResponder::new(&im);
     let mut respond = pin!(responder.run::<4, 4>());
 
@@ -142,7 +144,7 @@ fn main() -> Result<(), Error> {
     let mut mdns = pin!(mdns::run_mdns(&matter, &crypto));
     let mut transport = pin!(matter.run(&crypto, &socket, &socket, &socket));
 
-    if !matter.is_commissioned() {
+    if !matter.has_fabrics() {
         matter.print_standard_qr_text(DiscoveryCapabilities::IP)?;
         matter.print_standard_qr_code(QrTextType::Unicode, DiscoveryCapabilities::IP)?;
         matter.open_basic_comm_window(MAX_COMM_WINDOW_TIMEOUT_SECS, &crypto, &())?;
@@ -224,17 +226,34 @@ async fn run_switch<const N: usize>(
                 continue;
             }
 
-            // Only unicast OnOff targets (node + endpoint present).
-            let (Some(node), Some(endpoint)) = (binding.node, binding.endpoint) else {
-                continue;
-            };
-
             // If a specific cluster is bound, it must be OnOff.
             if let Some(cluster) = binding.cluster {
                 if cluster != on_off::FULL_CLUSTER.id {
                     continue;
                 }
             }
+
+            // Group targets: multicast an encrypted, fire-and-forget Toggle
+            // to the whole group, with an endpoint-less command path —
+            // receivers apply it to their group-member endpoints.
+            if let Some(group_id) = binding.group {
+                info!(
+                    "Switch: group-toggling fabric {}, group 0x{:04X}",
+                    binding.fab_idx, group_id
+                );
+
+                match group_toggle(matter, crypto, binding.fab_idx, group_id).await {
+                    Ok(()) => info!("Switch: group toggle ok"),
+                    Err(e) => warn!("Switch: group toggle failed: {:?}", e),
+                }
+
+                continue;
+            }
+
+            // Unicast OnOff targets (node + endpoint present).
+            let (Some(node), Some(endpoint)) = (binding.node, binding.endpoint) else {
+                continue;
+            };
 
             info!(
                 "Switch: toggling fabric {}, node 0x{:016X}, endpoint {}",
@@ -263,6 +282,36 @@ async fn toggle(
     let exchange = Exchange::initiate(matter, crypto, fab_idx, node).await?;
 
     exchange.on_off().toggle(endpoint).await
+}
+
+/// Multicast an encrypted, fire-and-forget `OnOff::Toggle` to `group_id`.
+async fn group_toggle(
+    matter: &Matter<'_>,
+    crypto: &impl Crypto,
+    fab_idx: NonZeroU8,
+    group_id: u16,
+) -> Result<(), Error> {
+    use rs_matter::im::client::ImClient as _;
+    use rs_matter::im::{CmdDataTag, CmdPath};
+    use rs_matter::tlv::{TLVTag, TLVWrite};
+
+    let exchange = Exchange::initiate_group(matter, crypto, fab_idx, group_id)?;
+
+    exchange
+        .group_invoke_with(|b| {
+            b.push()?
+                .path_from(&CmdPath::new(
+                    None,
+                    Some(on_off::FULL_CLUSTER.id),
+                    Some(on_off::CommandId::Toggle as u32),
+                ))?
+                .data(|w| {
+                    w.start_struct(&TLVTag::Context(CmdDataTag::Data as u8))?;
+                    w.end_container()
+                })?
+                .end()
+        })
+        .await
 }
 
 /// A minimal **momentary** Generic Switch cluster handler.

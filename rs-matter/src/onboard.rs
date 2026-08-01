@@ -332,7 +332,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
     /// the same UDP port post-AddNOC.
     ///
     /// Steps:
-    ///   1. Open a fresh **unsecured** exchange to `peer_addr` and run
+    ///   1. Open a fresh plaintext exchange to `peer_addr` and run
     ///      [`CaseInitiator::initiate`] (Sigma1 → Sigma2 → Sigma3 →
     ///      StatusReport). On success the new CASE session is keyed in
     ///      `matter.state.sessions` at `(fab_idx, device_node_id,
@@ -347,17 +347,42 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
     ) -> Result<(), Error> {
         let fab_idx = self.fab_idx;
 
-        // CASE handshake over a fresh unsecured exchange.
-        {
-            let mut exchange =
-                Exchange::initiate_unsecured(self.matter, &self.crypto, peer_addr).await?;
+        let exchange = Exchange::initiate_plaintext(self.matter, &self.crypto, peer_addr).await?;
+        CaseInitiator::perform(exchange, &self.crypto, fab_idx, phase1.device_node_id).await?;
 
-            CaseInitiator::initiate(&mut exchange, &self.crypto, fab_idx, phase1.device_node_id)
-                .await?;
+        // CommissioningComplete on the CASE session.
+        self.commissioning_complete(fab_idx, phase1.device_node_id)
+            .await
+    }
 
-            // The CASE-establishment exchange is one-shot; drop it
-            // here so we open a fresh one on the new CASE session.
-        }
+    /// Phase 2, resolving the device's operational address via mDNS.
+    ///
+    /// Identical to [`Self::complete_via_case`] except that, instead of being
+    /// handed a fixed `peer_addr`, it looks up the device's operational endpoint
+    /// via `_matter._tcp` mDNS from `(fabric, device_node_id)` (using
+    /// [`Exchange::initiate_plaintext_operational`]).
+    ///
+    /// This is the production phase-2 path: after phase 1 the device may only be
+    /// reachable at a *different* address than PASE used - most notably when the
+    /// device was commissioned over BLE and has since joined its operational
+    /// (Wi-Fi / Thread) network, where its operational IP is not known until it
+    /// announces itself. It requires the mDNS backend to be running (so the
+    /// resolve request is answered), and the device to have joined the network
+    /// and started announcing operationally.
+    pub async fn complete_via_case_operational(
+        &mut self,
+        phase1: &CommissionResult,
+    ) -> Result<(), Error> {
+        let fab_idx = self.fab_idx;
+
+        let exchange = Exchange::initiate_plaintext_operational(
+            self.matter,
+            &self.crypto,
+            fab_idx,
+            phase1.device_node_id,
+        )
+        .await?;
+        CaseInitiator::perform(exchange, &self.crypto, fab_idx, phase1.device_node_id).await?;
 
         // CommissioningComplete on the CASE session.
         self.commissioning_complete(fab_idx, phase1.device_node_id)

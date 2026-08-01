@@ -34,8 +34,10 @@ use super::clusters::net_comm::{
 use super::clusters::noc::{self, ClusterHandler as _, NocHandler};
 use super::clusters::sw_diag::{self, ClusterHandler as _, SwDiag, SwDiagHandler};
 use super::clusters::thread_diag::{self, ClusterHandler as _, ThreadDiag, ThreadDiagHandler};
-use super::clusters::time_sync::{self, ClusterHandler as _, TimeSync, TimeSyncHandler};
-use super::clusters::wifi_diag::{self, ClusterHandler as _, WifiDiag, WifiDiagHandler};
+use super::clusters::time_sync::{self, ClusterHandler as _, TimeSyncHandler};
+use super::clusters::wifi_diag::{
+    self, AlwaysConnected, ClusterHandler as _, WifiDiag, WifiDiagHandler, WirelessDiag,
+};
 use super::networks::eth::EthNetCtl;
 use super::types::{Async, ChainedHandler, Dataver, EndptId, EpClMatcher};
 
@@ -45,6 +47,9 @@ use super::types::{Async, ChainedHandler, Dataver, EndptId, EpClMatcher};
 /// as the corresponding tokens on the [`crate::clusters!`] macro.
 ///
 /// Optional cluster-shape modifiers (in order):
+/// - `acl(aux)` — makes the Access Control cluster advertise the provisional
+///   `AUXILIARY` feature and `AuxiliaryACL` attribute (e.g. for nodes hosting
+///   the Groupcast cluster).
 /// - `sw_diag(heap | watermarks | thread, …)` — shapes the Software
 ///   Diagnostics cluster.
 /// - `time_sync(time_zone | ntp_client | ntp_server | time_sync_client, …)` —
@@ -60,6 +65,7 @@ use super::types::{Async, ChainedHandler, Dataver, EndptId, EpClMatcher};
 #[macro_export]
 macro_rules! root_endpoint {
     ($t:ident
+        $(, acl($($acl_opt:ident),* $(,)?))?
         $(, sw_diag($($sw_opt:ident),* $(,)?))?
         $(, time_sync($($ts_opt:ident),* $(,)?))?
     ) => {
@@ -68,17 +74,21 @@ macro_rules! root_endpoint {
             device_types: $crate::devices!($crate::dm::devices::DEV_TYPE_ROOT_NODE),
             clusters: $crate::clusters!(
                 $t
+                $(, acl($($acl_opt),*))?
                 $(, sw_diag($($sw_opt),*))?
                 $(, time_sync($($ts_opt),*))?
                 ;
             ),
             client_clusters: &[],
+            unique_id: None,
+            semantic_tags: &[],
         }
     }
 }
 
 /// A type alias for the handler chain returned by `eth_sys_handler()`.
-pub type EthSysHandler<'a> = SysHandler<'a, EthNetCtl, eth_diag::HandlerAdaptor<EthDiagHandler>>;
+pub type EthSysHandler<'a> =
+    SysHandler<'a, EthNetCtl<'a>, eth_diag::HandlerAdaptor<EthDiagHandler>>;
 
 /// A type alias for the handler chain returned by `wifi_sys_handler()`.
 pub type WifiSysHandler<'a, T> = SysHandler<'a, T, wifi_diag::HandlerAdaptor<WifiDiagHandler<'a>>>;
@@ -89,7 +99,7 @@ pub type ThreadSysHandler<'a, T> =
 
 /// A type alias for the handler chain returned by `sys_handler()`.
 pub type SysHandler<'a, T, N> = handler_chain_type!(
-    EpClMatcher => net_comm::HandlerAsyncAdaptor<NetCommHandler<T>>
+    EpClMatcher => net_comm::HandlerAsyncAdaptor<NetCommHandler<'a, T>>
     | Async<handler_chain_type!(
         EpClMatcher => desc::HandlerAdaptor<DescHandler<'a>>,
         EpClMatcher => basic_info::HandlerAdaptor<BasicInfoHandler>,
@@ -115,9 +125,6 @@ pub const ROOT_ENDPOINT_ID: EndptId = 0;
 /// - `comm_policy`: The `CommPolicy` implementation.
 /// - `gen_diag`: The `GenDiag` implementation.
 /// - `netif_diag`: The `NetifDiag` implementation.
-/// - `time_sync`: The `TimeSync` implementation (pass `&()` for the
-///   no-op default: `UTCTime = Null`, `Granularity = NoTime`,
-///   `TimeSource = None`).
 /// - `sw_diag`: The `SwDiag` implementation (pass `&()` for the
 ///   no-op default: heap counters report `0`).
 /// - `rand`: A random number generator.
@@ -126,7 +133,6 @@ pub fn eth_sys_handler<'a, R: RngCore>(
     comm_policy: &'a dyn CommPolicy,
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     mut rand: R,
 ) -> EthSysHandler<'a> {
@@ -134,9 +140,9 @@ pub fn eth_sys_handler<'a, R: RngCore>(
         comm_policy,
         gen_diag,
         netif_diag,
-        time_sync,
         sw_diag,
-        EthNetCtl,
+        EthNetCtl::new_default(),
+        &AlwaysConnected,
         EthDiagHandler::CLUSTER.id,
         EthDiagHandler::new(Dataver::new_rand(&mut rand)).adapt(),
         rand,
@@ -151,7 +157,6 @@ pub fn eth_sys_handler<'a, R: RngCore>(
 /// - `gen_diag`: The `GenDiag` implementation.
 /// - `netif_diag`: The `NetifDiag` implementation.
 /// - `wifi_diag`: The `WifiDiag` implementation.
-/// - `time_sync`: The `TimeSync` implementation (pass `&()` for the no-op default).
 /// - `sw_diag`: The `SwDiag` implementation (pass `&()` for the no-op default).
 /// - `net_ctl`: The `NetCtl` implementation.
 /// - `rand`: A random number generator.
@@ -161,7 +166,6 @@ pub fn wifi_sys_handler<'a, R: RngCore, T>(
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
     wifi_diag: &'a dyn WifiDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     net_ctl: T,
     mut rand: R,
@@ -173,9 +177,9 @@ where
         comm_policy,
         gen_diag,
         netif_diag,
-        time_sync,
         sw_diag,
         net_ctl,
+        wifi_diag,
         WifiDiagHandler::CLUSTER.id,
         WifiDiagHandler::new(Dataver::new_rand(&mut rand), wifi_diag).adapt(),
         rand,
@@ -190,7 +194,6 @@ where
 /// - `gen_diag`: The `GenDiag` implementation.
 /// - `netif_diag`: The `NetifDiag` implementation.
 /// - `thread_diag`: The `ThreadDiag` implementation.
-/// - `time_sync`: The `TimeSync` implementation (pass `&()` for the no-op default).
 /// - `sw_diag`: The `SwDiag` implementation (pass `&()` for the no-op default).
 /// - `net_ctl`: The `NetCtl` implementation.
 /// - `rand`: A random number generator.
@@ -200,7 +203,6 @@ pub fn thread_sys_handler<'a, R: RngCore, T>(
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
     thread_diag: &'a dyn ThreadDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     net_ctl: T,
     mut rand: R,
@@ -212,9 +214,9 @@ where
         comm_policy,
         gen_diag,
         netif_diag,
-        time_sync,
         sw_diag,
         net_ctl,
+        thread_diag,
         ThreadDiagHandler::CLUSTER.id,
         ThreadDiagHandler::new(Dataver::new_rand(&mut rand), thread_diag).adapt(),
         rand,
@@ -240,9 +242,9 @@ fn sys_handler<'a, R: RngCore, T, N>(
     comm_policy: &'a dyn CommPolicy,
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     net_ctl: T,
+    wireless_diag: &'a dyn WirelessDiag,
     netw_diag_cluster_id: ClusterId,
     netw_diag: N,
     mut rand: R,
@@ -255,7 +257,7 @@ where
             Some(ROOT_ENDPOINT_ID),
             Some(NetCommHandler::<T>::CLUSTER.id),
         ),
-        NetCommHandler::new(Dataver::new_rand(&mut rand), net_ctl).adapt(),
+        NetCommHandler::new(Dataver::new_rand(&mut rand), net_ctl, wireless_diag).adapt(),
         Async(
             ChainedHandler::new(
                 EpClMatcher::new(Some(ROOT_ENDPOINT_ID), Some(netw_diag_cluster_id)),
@@ -268,7 +270,7 @@ where
             )
             .chain(
                 EpClMatcher::new(Some(ROOT_ENDPOINT_ID), Some(TimeSyncHandler::CLUSTER.id)),
-                TimeSyncHandler::new(Dataver::new_rand(&mut rand), time_sync).adapt(),
+                TimeSyncHandler::new(Dataver::new_rand(&mut rand)).adapt(),
             )
             .chain(
                 EpClMatcher::new(Some(ROOT_ENDPOINT_ID), Some(SwDiagHandler::CLUSTER.id)),
@@ -332,7 +334,6 @@ pub struct EthSysHandlerBuilder<'a> {
     comm_policy: &'a dyn CommPolicy,
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
 }
 
@@ -349,7 +350,6 @@ impl<'a> EthSysHandlerBuilder<'a> {
             comm_policy: &true,
             gen_diag: &(),
             netif_diag: &(),
-            time_sync: &(),
             sw_diag: &(),
         }
     }
@@ -372,18 +372,6 @@ impl<'a> EthSysHandlerBuilder<'a> {
         self
     }
 
-    /// Set the `TimeSync` hook (feature-gated members of the Time
-    /// Synchronization cluster — `TIME_ZONE` / `NTP_CLIENT` /
-    /// `NTP_SERVER` / `TIME_SYNC_CLIENT`). The mandatory members
-    /// (`UTCTime`, `Granularity`, `TimeSource`, `SetUTCTime`) are
-    /// always served from the Matter-wide
-    /// [Last-Known-Good UTC Time](crate::Matter::last_known_utc_time)
-    /// state and don't need a provider.
-    pub const fn time_sync(mut self, time_sync: &'a dyn TimeSync) -> Self {
-        self.time_sync = time_sync;
-        self
-    }
-
     /// Set the `SwDiag` hook (Software Diagnostics data provider).
     pub const fn sw_diag(mut self, sw_diag: &'a dyn SwDiag) -> Self {
         self.sw_diag = sw_diag;
@@ -396,7 +384,6 @@ impl<'a> EthSysHandlerBuilder<'a> {
             self.comm_policy,
             self.gen_diag,
             self.netif_diag,
-            self.time_sync,
             self.sw_diag,
             rand,
         )
@@ -412,7 +399,6 @@ pub struct WifiSysHandlerBuilder<'a, T> {
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
     wifi_diag: &'a dyn WifiDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     net_ctl: T,
 }
@@ -429,7 +415,6 @@ where
             gen_diag: &(),
             netif_diag: &(),
             wifi_diag,
-            time_sync: &(),
             sw_diag: &(),
             net_ctl,
         }
@@ -450,13 +435,6 @@ where
     /// Set the `NetifDiag` hook.
     pub const fn netif_diag(mut self, netif_diag: &'a dyn NetifDiag) -> Self {
         self.netif_diag = netif_diag;
-        self
-    }
-
-    /// Set the `TimeSync` hook (feature-gated members only — see
-    /// [`EthSysHandlerBuilder::time_sync`]).
-    pub const fn time_sync(mut self, time_sync: &'a dyn TimeSync) -> Self {
-        self.time_sync = time_sync;
         self
     }
 
@@ -473,7 +451,6 @@ where
             self.gen_diag,
             self.netif_diag,
             self.wifi_diag,
-            self.time_sync,
             self.sw_diag,
             self.net_ctl,
             rand,
@@ -490,7 +467,6 @@ pub struct ThreadSysHandlerBuilder<'a, T> {
     gen_diag: &'a dyn GenDiag,
     netif_diag: &'a dyn NetifDiag,
     thread_diag: &'a dyn ThreadDiag,
-    time_sync: &'a dyn TimeSync,
     sw_diag: &'a dyn SwDiag,
     net_ctl: T,
 }
@@ -507,7 +483,6 @@ where
             gen_diag: &(),
             netif_diag: &(),
             thread_diag,
-            time_sync: &(),
             sw_diag: &(),
             net_ctl,
         }
@@ -531,13 +506,6 @@ where
         self
     }
 
-    /// Set the `TimeSync` hook (feature-gated members only — see
-    /// [`EthSysHandlerBuilder::time_sync`]).
-    pub const fn time_sync(mut self, time_sync: &'a dyn TimeSync) -> Self {
-        self.time_sync = time_sync;
-        self
-    }
-
     /// Set the `SwDiag` hook.
     pub const fn sw_diag(mut self, sw_diag: &'a dyn SwDiag) -> Self {
         self.sw_diag = sw_diag;
@@ -551,7 +519,6 @@ where
             self.gen_diag,
             self.netif_diag,
             self.thread_diag,
-            self.time_sync,
             self.sw_diag,
             self.net_ctl,
             rand,

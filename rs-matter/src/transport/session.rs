@@ -23,10 +23,15 @@ use cfg_if::cfg_if;
 
 use rand_core::RngCore;
 
-use crate::crypto::{canon, CanonAeadKey, CanonAeadKeyRef, Crypto, CryptoSensitive, Kdf};
+use crate::crypto::{
+    canon, CanonAeadKey, CanonAeadKeyRef, CanonPkcSharedSecret, CanonPkcSharedSecretRef, Crypto,
+    CryptoSensitive, Kdf,
+};
 use crate::dm::clusters::basic_info::BasicInfoConfig;
 use crate::error::{Error, ErrorCode};
+#[cfg(feature = "groups")]
 use crate::fabric::Fabrics;
+#[cfg(feature = "groups")]
 use crate::group_keys::KeySet;
 use crate::sc::SessionParameters;
 use crate::transport::exchange::ExchangeId;
@@ -36,13 +41,16 @@ use crate::utils::init::{init, Init, IntoFallibleInit};
 use crate::utils::storage::{ParseBuf, Vec, WriteBuf};
 use crate::{Matter, MatterState};
 
-use super::dedup::{GroupCtrStore, RxCtrState};
+#[cfg(feature = "groups")]
+use super::dedup::GroupCtrStore;
+use super::dedup::RxCtrState;
 use super::exchange::{ExchangeState, MessageMeta, Role};
-use super::mrp::RetransEntry;
+use super::mrp::{mrp_log, RetransEntry};
 use super::network::Address;
 use super::packet::PacketHdr;
 use super::plain_hdr::PlainHdr;
 use super::proto_hdr::ProtoHdr;
+#[cfg(feature = "groups")]
 use super::Packet;
 
 pub const MAX_CAT_IDS_PER_NOC: usize = 3;
@@ -102,6 +110,16 @@ pub struct Session {
     // So, we might keep this as enc_key and dec_key for now
     dec_key: CanonAeadKey,
     enc_key: CanonAeadKey,
+    /// The ECDH shared secret computed during the original full CASE
+    /// handshake, retained on the session for the sole purpose of
+    /// populating [`crate::sc::case::ResumableSession`] records for
+    /// the resumption cache. Zeroed for non-CASE sessions.
+    ///
+    /// Kept as a field unconditionally so the `new`/`init` constructors
+    /// need no `case-resumption`-specific variant; it is simply written
+    /// but never read when resumption is off.
+    #[cfg_attr(not(feature = "case-resumption"), allow(dead_code))]
+    shared_secret: CanonPkcSharedSecret,
     att_challenge: AttChallenge,
     local_sess_id: u16,
     peer_sess_id: u16,
@@ -148,6 +166,7 @@ impl Session {
             peer_nodeid,
             dec_key: CanonAeadKey::new(),
             enc_key: CanonAeadKey::new(),
+            shared_secret: CanonPkcSharedSecret::new(),
             att_challenge: AttChallenge::new(),
             peer_sess_id: 0,
             local_sess_id: 0,
@@ -182,6 +201,7 @@ impl Session {
             peer_nodeid,
             dec_key <- CanonAeadKey::init(),
             enc_key <- CanonAeadKey::init(),
+            shared_secret <- CanonPkcSharedSecret::init(),
             att_challenge <- AttChallenge::init(),
             peer_sess_id: 0,
             local_sess_id: 0,
@@ -243,6 +263,7 @@ impl Session {
         &self.mode
     }
 
+    #[cfg(feature = "groups")]
     pub(crate) fn set_session_mode(&mut self, mode: SessionMode) {
         self.mode = mode;
     }
@@ -319,6 +340,20 @@ impl Session {
                 Some(self.enc_key.reference())
             }
             SessionMode::PlainText => None,
+        }
+    }
+
+    /// The ECDH shared secret from the original full CASE handshake,
+    /// or `None` for non-CASE sessions. Consumed by the background
+    /// snapshot task to build [`crate::sc::case::ResumableSession`]
+    /// records — the "SharedSecret" that the Matter spec lists as
+    /// part of the Session Resumption State.
+    #[cfg(feature = "case-resumption")]
+    #[allow(dead_code)]
+    pub fn get_shared_secret(&self) -> Option<CanonPkcSharedSecretRef<'_>> {
+        match self.mode {
+            SessionMode::Case { .. } => Some(self.shared_secret.reference()),
+            SessionMode::Pase { .. } | SessionMode::Group { .. } | SessionMode::PlainText => None,
         }
     }
 
@@ -455,10 +490,25 @@ impl Session {
         }
     }
 
+    /// Whether the session's peer address is a multicast address — true only
+    /// for TX group sessions (see [`Sessions::get_or_create_for_group_tx`]).
+    pub(crate) fn is_peer_multicast(&self) -> bool {
+        match &self.peer_addr {
+            Address::Udp(crate::transport::network::SocketAddr::V6(addr)) => {
+                addr.ip().is_multicast()
+            }
+            Address::Udp(crate::transport::network::SocketAddr::V4(addr)) => {
+                addr.ip().is_multicast()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn pre_send(
         &mut self,
         exch_index: Option<usize>,
         tx_header: &mut PacketHdr,
+        group_data_ctr: Option<u32>,
         session_active_interval_ms: Option<u32>,
         session_idle_interval_ms: Option<u32>,
     ) -> Result<(Address, bool), Error> {
@@ -471,21 +521,75 @@ impl Session {
 
         let retransmission = ctr.is_some();
 
+        let is_group = matches!(self.mode, SessionMode::Group { .. });
+
+        // Whether this outbound message is a control-plane message
+        // (only MCSP opcodes today). Used to set the `C` bit, to pick
+        // DSIZ = 1 vs. the groupcast destination, and to pick the
+        // per-session vs. the global group data message counter.
+        let is_control = is_group && MessageMeta::from(&tx_header.proto).is_control_msg();
+
+        // For a group session, `local_sess_id == peer_sess_id` — both
+        // hold the same Group Session Id derived from the operational
+        // group key (see `get_or_create_for_group_rx`) — so this line
+        // works uniformly for unicast replies and group control messages.
         tx_header.plain.sess_id = self.get_peer_sess_id();
-        tx_header.plain.ctr = ctr.unwrap_or_else(|| self.get_msg_ctr());
-        // For unsecured initiator sessions, set Source Node ID to our ephemeral
-        // initiator node ID (spec: "enclosed by initiator as Source Node ID").
-        // Encrypted sessions and responder unsecured sessions (local_nodeid=0) send no Source.
+        tx_header.plain.ctr = if let Some(ctr) = ctr {
+            ctr
+        } else if is_group && !is_control {
+            // Group data messages use the Global Group Encrypted Data
+            // Message Counter — one counter across all groups, so the
+            // per-source counter tracking on the receiving side stays
+            // monotonic — supplied by the caller from
+            // `Sessions::next_global_group_data_ctr`.
+            group_data_ctr.ok_or(ErrorCode::InvalidState)?
+        } else {
+            self.get_msg_ctr()
+        };
+
+        // Include the Source Node ID for:
+        // - Unsecured initiator sessions (spec).
+        // - Every outbound message on a group session, so receivers can
+        //   look up the sender's Group Peer State.
+        // CASE/PASE responder-side messages omit it.
         tx_header.plain.set_src_nodeid(
-            (!self.is_encrypted() && self.local_nodeid != 0).then_some(self.local_nodeid),
-        );
-        tx_header.plain.set_dst_unicast_nodeid(
-            (self.mode == SessionMode::PlainText)
-                .then_some(self.peer_nodeid)
-                .flatten(),
+            ((!self.is_encrypted() || is_group) && self.local_nodeid != 0)
+                .then_some(self.local_nodeid),
         );
 
+        // Destination Node ID (DSIZ):
+        // - Plaintext: echo `peer_nodeid` back to the initiator.
+        // - Group control (MCSP reply): DSIZ = 1, destination =
+        //   originator's Node ID.
+        // - Group data: DSIZ = 2, destination = the target Group ID
+        //   (carried by the session mode, see `get_or_create_for_group_tx`).
+        // - CASE/PASE: no DSIZ; clear.
+        #[allow(irrefutable_let_patterns)]
+        if self.mode == SessionMode::PlainText || is_control {
+            tx_header.plain.set_dst_unicast_nodeid(self.peer_nodeid);
+        } else if let SessionMode::Group { group_id, .. } = self.mode {
+            tx_header.plain.set_dst_groupcast_nodeid(Some(group_id));
+        } else {
+            tx_header.plain.set_dst_unicast_nodeid(None);
+        }
+
+        if is_group {
+            use super::plain_hdr::SecFlags;
+            tx_header.plain.sec_flags |= SecFlags::GROUP_SESSION;
+            tx_header.plain.set_control_msg(is_control);
+        }
+
         tx_header.proto.adjust_reliability(false, &self.peer_addr);
+
+        if is_group && !is_control {
+            // Group DATA messages never use MRP: they are multicast
+            // fire-and-forget, so there is nobody to acknowledge them.
+            // Group CONTROL messages (MCSP) are unicast-addressed and stay
+            // reliable - which is also what keeps their (ephemeral) session
+            // alive until the reply has been encoded.
+            tx_header.proto.unset_reliable();
+            tx_header.proto.set_ack(None);
+        }
 
         if let Some(exchange_index) = exch_index {
             let exchange = unwrap!(self.exchanges[exchange_index].as_mut());
@@ -597,7 +701,7 @@ impl Session {
             false
         } else if exchange.mrp.is_ack_pending() {
             exchange.role.set_dropped_state();
-            warn!(
+            mrp_log!(
                 "Exchange {}: Pending ACK. Marking as dropped",
                 exchange_id.display(self)
             );
@@ -686,6 +790,7 @@ impl<'a> ReservedSession<'a> {
         dec_key: Option<CanonAeadKeyRef<'_>>,
         enc_key: Option<CanonAeadKeyRef<'_>>,
         att_challenge: Option<AttChallengeRef<'_>>,
+        shared_secret: Option<CanonPkcSharedSecretRef<'_>>,
     ) -> Result<(), Error> {
         self.matter.with_state(|state| {
             self.update_with_state(
@@ -699,6 +804,7 @@ impl<'a> ReservedSession<'a> {
                 dec_key,
                 enc_key,
                 att_challenge,
+                shared_secret,
             )
         })
     }
@@ -716,6 +822,7 @@ impl<'a> ReservedSession<'a> {
         dec_key: Option<CanonAeadKeyRef<'_>>,
         enc_key: Option<CanonAeadKeyRef<'_>>,
         att_challenge: Option<AttChallengeRef<'_>>,
+        shared_secret: Option<CanonPkcSharedSecretRef<'_>>,
     ) -> Result<(), Error> {
         let session = state.sessions.get(self.id).ok_or(ErrorCode::NoSession)?;
 
@@ -738,6 +845,10 @@ impl<'a> ReservedSession<'a> {
             session.att_challenge.load(att_challenge);
         }
 
+        if let Some(shared_secret) = shared_secret {
+            session.shared_secret.load(shared_secret);
+        }
+
         Ok(())
     }
 
@@ -758,7 +869,7 @@ impl<'a> ReservedSession<'a> {
         })
     }
 
-    pub fn complete(mut self) {
+    pub fn complete(&mut self) {
         self.complete = true;
     }
 }
@@ -846,7 +957,27 @@ pub struct Sessions {
     next_sess_id: u16,
     next_exch_id: u16,
     sessions: Vec<Session, MAX_SESSIONS>,
+    #[cfg(feature = "groups")]
     group_ctr_store: GroupCtrStore,
+    /// The current Global Group Encrypted Data Message Counter reported
+    /// to peers as the "Synchronized Counter" in `MsgCounterSyncRsp` and
+    /// (once group-data sending is implemented) used to encode outgoing
+    /// group data messages.
+    ///
+    /// `0` means "not yet initialized"; use
+    /// [`Sessions::get_or_init_global_group_data_ctr`] to obtain a valid
+    /// non-zero value.
+    ///
+    /// TODO: Not persisted yet — the counter is re-randomized on each
+    /// process start, whereas the spec requires persisting it (with an
+    /// epoch/stride scheme) so it never goes backwards across reboots: a
+    /// receiver tracking our source in its group counter store may
+    /// otherwise reject our post-reboot group data messages as replays
+    /// until the fresh random value exceeds the old one. Follow the
+    /// (equally not-yet-wired) `Matter::run_persist_resumption` pattern
+    /// when addressing this.
+    #[cfg(feature = "groups")]
+    global_group_data_ctr: u32,
 }
 
 impl Sessions {
@@ -855,40 +986,253 @@ impl Sessions {
     pub const fn new() -> Self {
         Self {
             sessions: Vec::new(),
+            #[cfg(feature = "groups")]
             group_ctr_store: GroupCtrStore::new(),
             next_sess_unique_id: 0,
             next_sess_id: 1,
-            next_exch_id: 1,
+            next_exch_id: 0,
+            #[cfg(feature = "groups")]
+            global_group_data_ctr: 0,
         }
     }
 
     /// Create an in-place initializer for a new Sessions instance.
     pub fn init() -> impl Init<Self> {
-        init!(Self {
+        // The `init!` macro does not accept `#[cfg]` on fields, so the two
+        // group-only fields force two variants that differ only by them.
+        #[cfg(feature = "groups")]
+        let r = init!(Self {
             sessions <- Vec::init(),
             group_ctr_store: GroupCtrStore::new(),
             next_sess_unique_id: 0,
             next_sess_id: 1,
-            next_exch_id: 1,
-        })
+            next_exch_id: 0,
+            global_group_data_ctr: 0,
+        });
+        #[cfg(not(feature = "groups"))]
+        let r = init!(Self {
+            sessions <- Vec::init(),
+            next_sess_unique_id: 0,
+            next_sess_id: 1,
+            next_exch_id: 0,
+        });
+        r
     }
 
     pub fn reset(&mut self) {
         self.sessions.clear();
-        self.group_ctr_store = GroupCtrStore::new();
+        #[cfg(feature = "groups")]
+        {
+            self.group_ctr_store = GroupCtrStore::new();
+        }
         self.next_sess_id = 1;
-        self.next_exch_id = 1;
+        self.next_exch_id = 0;
+        // Deliberately keep `global_group_data_ctr`: a `reset` isn't a
+        // factory reset, and rolling it back would break peers that
+        // just learned it via MCSP.
+    }
+}
+
+/// Group (multicast) session handling: on-the-fly key derivation for received
+/// group-encrypted messages, and the global group data-message counter. Behind
+/// the `groups` feature — a unicast-only device never creates group sessions.
+#[cfg(feature = "groups")]
+impl Sessions {
+    /// Return the current Global Group Encrypted Data Message Counter,
+    /// lazily initialized to a random value in `[1, 2^28 - 1]` on first
+    /// access. The upper 4 bits are kept zero to leave headroom for
+    /// wrap-safe monotonic growth.
+    pub(crate) fn get_or_init_global_group_data_ctr<C: Crypto>(
+        &mut self,
+        crypto: C,
+    ) -> Result<u32, Error> {
+        if self.global_group_data_ctr == 0 {
+            // Draw once and fall back to 1 in the (astronomically
+            // unlikely) all-zero case; peers ignore a `MsgCounterSyncRsp`
+            // whose Synchronized Counter is 0.
+            let candidate = crypto.rand()?.next_u32() & MATTER_MSG_CTR_RANGE;
+            self.global_group_data_ctr = if candidate == 0 { 1 } else { candidate };
+        }
+        Ok(self.global_group_data_ctr)
     }
 
-    /// Attempt to decrypt and accept a group (multicast) message.
+    /// Return the current Global Group Encrypted Data Message Counter and
+    /// advance it — one counter across ALL outgoing group data messages, so
+    /// the per-source counter tracking on the receiving side stays monotonic
+    /// regardless of which group a message targets.
     ///
-    /// Derives group operational keys on-the-fly from `FabricMgr`, matching
-    /// the packet's `(session_id, group_id)`, tries to decrypt with each,
-    /// validates the group message counter, and creates an ephemeral group
-    /// session on success.
+    /// Counter-initialization requires randomness, so it is done by
+    /// [`Sessions::get_or_create_for_group_tx`] (which has a crypto instance
+    /// at hand) — erroring out here on an uninitialized counter rather than
+    /// carrying a crypto parameter into the send path.
+    pub(crate) fn next_global_group_data_ctr(&mut self) -> Result<u32, Error> {
+        if self.global_group_data_ctr == 0 {
+            return Err(ErrorCode::InvalidState.into());
+        }
+
+        let ctr = self.global_group_data_ctr;
+
+        // Advance within the counter range, skipping 0 (the "uninitialized"
+        // marker here, and a value peers ignore in `MsgCounterSyncRsp`).
+        let next = ctr.wrapping_add(1) & MATTER_MSG_CTR_RANGE;
+        self.global_group_data_ctr = if next == 0 { 1 } else { next };
+
+        Ok(ctr)
+    }
+
+    /// Get or create a TX group session for sending group data messages to
+    /// `(fab_idx, group_id)`.
     ///
-    /// Returns the created session and payload range, mirroring how unicast
-    /// uses `get_for_rx()` + `decode_remaining()`.
+    /// The mirror image of [`Sessions::get_or_create_for_group_rx`]: keyed
+    /// with the group's *active* operational key (the epoch key with the
+    /// highest start time — RX tries all of them instead), carrying the
+    /// derived Group Session ID in both session-id slots, and addressed at
+    /// the group's multicast address per its multicast-address policy.
+    ///
+    /// Also seeds the Global Group Encrypted Data Message Counter, which
+    /// [`Session::pre_send`] stamps into every outgoing group data message
+    /// (via [`Sessions::next_global_group_data_ctr`]).
+    pub(crate) fn get_or_create_for_group_tx<C: Crypto>(
+        &mut self,
+        crypto: C,
+        fabrics: &Fabrics,
+        fab_idx: NonZeroU8,
+        group_id: u16,
+        dev_det: &BasicInfoConfig<'_>,
+    ) -> Result<&mut Session, Error> {
+        use crate::dm::clusters::decl::groupcast::MulticastAddrPolicyEnum;
+        use crate::transport::network::{SocketAddr, SocketAddrV6};
+
+        let fabric = fabrics.fabric(fab_idx)?;
+
+        // The group's security material: the first key set mapped to the
+        // group, with its active epoch key.
+        let map_entry = fabric
+            .groups()
+            .key_map_iter()
+            .find(|entry| entry.group_id == group_id)
+            .ok_or(ErrorCode::NotFound)?;
+        let key_set = fabric
+            .groups()
+            .key_set_get(map_entry.group_key_set_id)
+            .ok_or(ErrorCode::NotFound)?;
+        let epoch_key_entry = key_set
+            .epoch_keys
+            .iter()
+            .max_by_key(|entry| entry.epoch_start_time)
+            .ok_or(ErrorCode::NotFound)?;
+
+        let mut derived = KeySet::new();
+        derived.update(
+            &crypto,
+            epoch_key_entry.epoch_key.reference(),
+            &fabric.compressed_fabric_id(),
+        )?;
+        let op_key = derived.op_key();
+        let session_id = derive_group_session_id(&crypto, op_key)?;
+
+        // Destination: the group's multicast address, per its policy. A
+        // group the sender is no member of (a sender-only role) has no
+        // group-table entry and uses the `PerGroup` default.
+        let ip = match fabric
+            .groups()
+            .get(group_id)
+            .map(|entry| entry.effective_mcast_policy())
+            .unwrap_or(MulticastAddrPolicyEnum::PerGroup)
+        {
+            MulticastAddrPolicyEnum::IanaAddr => crate::utils::ipv6::IANA_GROUPCAST_MULTICAST_ADDR,
+            MulticastAddrPolicyEnum::PerGroup => {
+                crate::utils::ipv6::compute_group_multicast_addr(fabric.fabric_id(), group_id)
+            }
+        };
+        let peer = Address::Udp(SocketAddr::V6(SocketAddrV6::new(
+            ip,
+            crate::MATTER_PORT,
+            0,
+            0,
+        )));
+        let fabric_node_id = fabric.node_id();
+
+        // Seed the global data counter while we hold a crypto instance.
+        self.get_or_init_global_group_data_ctr(&crypto)?;
+
+        // Reuse a previously-created TX session for this group: same mode
+        // and the multicast peer address (RX-created group sessions carry
+        // the sender's unicast address instead), still keyed with the
+        // active key — checked via the derived Group Session ID, so a key
+        // rotation transparently rolls onto a fresh session.
+        let existing = self.sessions.iter().position(|sess| {
+            matches!(
+                sess.mode,
+                SessionMode::Group {
+                    fab_idx: f,
+                    group_id: g
+                } if f == fab_idx && g == group_id
+            ) && sess.peer_addr == peer
+                && sess.local_sess_id == session_id
+        });
+
+        if let Some(index) = existing {
+            let session = unwrap!(self.sessions.get_mut(index));
+            session.update_last_used();
+            return Ok(session);
+        }
+
+        let mut rand = crypto.weak_rand()?;
+
+        let session = match self.add(rand.next_u32(), false, peer, None, dev_det) {
+            Ok(session) => session,
+            Err(_) => {
+                // Session table is full; evict the least-recently-used session
+                if let Some(lru_id) = self.get_session_for_eviction().map(|sess| sess.id) {
+                    debug!("Group TX: Evicting session {} to make room", lru_id);
+                    self.remove(lru_id);
+                    self.add(rand.next_u32(), false, peer, None, dev_det)?
+                } else {
+                    return Err(ErrorCode::NoSpaceSessions.into());
+                }
+            }
+        };
+
+        session.set_session_mode(SessionMode::Group { fab_idx, group_id });
+        session.local_sess_id = session_id;
+        session.peer_sess_id = session_id;
+        // Group sessions always emit their Source Node ID.
+        session.set_local_nodeid(fabric_node_id);
+        session.enc_key.load(op_key);
+        session.dec_key.load(op_key);
+
+        debug!(
+            "Group TX: Created group session for fab_idx={}, group_id=0x{:04x}, dst={}",
+            fab_idx, group_id, peer
+        );
+
+        let session = unwrap!(self.sessions.last_mut());
+        session.update_last_used();
+
+        Ok(session)
+    }
+
+    /// Attempt to decrypt and accept a group-encrypted message.
+    ///
+    /// Handles two flavors of incoming group-encrypted packet:
+    ///
+    /// * Multicast group data message (groupcast destination Node ID):
+    ///   match `(session_id, group_id)` against the fabric's group key
+    ///   map, try each candidate operational key, and validate the
+    ///   group data message counter (trust-first).
+    /// * Unicast group-encrypted control message (unicast destination
+    ///   Node ID equal to one of our fabric identities), e.g. an
+    ///   MCSP `MsgCounterSyncReq`. There is no `group_id` filter here;
+    ///   every group key mapped for the matching fabric is tried.
+    ///
+    /// On success the derived operational key is copied onto the newly
+    /// created session (both `enc_key` and `dec_key`) so downstream
+    /// handlers — in particular the MCSP responder — can encrypt their
+    /// reply with the same key.
+    ///
+    /// Returns the created session and payload range, mirroring how
+    /// unicast uses `get_for_rx()` + `decode_remaining()`.
     pub(crate) fn get_or_create_for_group_rx<const N: usize, C: Crypto>(
         &mut self,
         crypto: C,
@@ -901,17 +1245,28 @@ impl Sessions {
             .plain
             .get_src_nodeid()
             .ok_or(ErrorCode::InvalidData)?;
-        let group_id = packet
-            .header
-            .plain
-            .get_dst_groupcast_nodeid()
-            .ok_or(ErrorCode::InvalidData)?;
+        // Either DSIZ = 2 (groupcast) or DSIZ = 1 (unicast to us, MCSP-style).
+        // Anything else is malformed.
+        let dst_group_id = packet.header.plain.get_dst_groupcast_nodeid();
+        let dst_unicast_nodeid = packet.header.plain.get_dst_unicast_nodeid();
+
+        if dst_group_id.is_none() && dst_unicast_nodeid.is_none() {
+            return Err(ErrorCode::InvalidData.into());
+        }
+
         let expected_sess_id = packet.header.plain.sess_id;
         let msg_ctr = packet.header.plain.ctr;
+        let is_control = packet.header.plain.is_control_msg();
 
         debug!(
-            "Group: Attempting decrypt for PEER={:?} SID=0x{:04x}, GRP=0x{:04x}, SRC=0x{:016x}, CTR={}",
-            packet.peer, expected_sess_id, group_id, src_nodeid, msg_ctr
+            "Group: Attempting decrypt for PEER={:?} SID=0x{:04x}, GRP={:?}, DSTU={:?}, SRC=0x{:016x}, CTR={}, C={}",
+            packet.peer,
+            expected_sess_id,
+            dst_group_id,
+            dst_unicast_nodeid,
+            src_nodeid,
+            msg_ctr,
+            is_control
         );
 
         // Parse the plain header to determine encrypted portion offset
@@ -922,21 +1277,62 @@ impl Sessions {
         let encrypted_offset = pb.read_off();
         let encrypted_len = pb.as_slice().len();
         let mut saved_encrypted = [0u8; 1280];
+
         if encrypted_len > saved_encrypted.len() {
             return Err(ErrorCode::BufferTooSmall.into());
         }
+
         saved_encrypted[..encrypted_len].copy_from_slice(pb.as_slice());
 
-        // Derive keys on-the-fly and try each one
-        let mut group_key_found: Option<(NonZeroU8, (usize, usize))> = None;
+        // Derive keys on-the-fly and try each one. When a key decrypts,
+        // we remember its operational key material so we can copy it
+        // onto the created session (needed by the MCSP responder to
+        // encrypt its reply with the same key).
+        //
+        // `effective_group_id` is:
+        //   * the incoming groupcast id for the multicast flow, or
+        //   * for the unicast/MCSP flow, the first group_id that maps to
+        //     the matching key set (or 0 when the key set has no
+        //     mapping) — MCSP itself is bound to a key, not a group, so
+        //     any value is acceptable here.
+        struct GroupKeyFound {
+            fab_idx: NonZeroU8,
+            group_id: u16,
+            fabric_node_id: u64,
+            op_key: CanonAeadKey,
+            payload_range: (usize, usize),
+        }
+
+        let mut group_key_found: Option<GroupKeyFound> = None;
+        // Whether at least one candidate key matched the message's group
+        // session ID (and was therefore actually tried for decryption) -
+        // distinguishes "authentication failed" from "no key available"
+        // for Groupcast testing-mode diagnostics.
+        let mut key_attempted = false;
 
         'outer: for fabric in fabrics.iter() {
+            // For unicast (MCSP) messages the destination Node ID must
+            // match one of our fabric identities; skip fabrics whose
+            // node id doesn't match, to avoid pointlessly trying keys
+            // that could not have secured a reply to us.
+            if let Some(dst_node) = dst_unicast_nodeid {
+                if fabric.node_id() != dst_node {
+                    continue;
+                }
+            }
+
             let fab_idx = fabric.fab_idx();
             let compressed_fabric_id = fabric.compressed_fabric_id();
+            let fabric_node_id = fabric.node_id();
 
             for map_entry in fabric.groups().key_map_iter() {
-                if map_entry.group_id != group_id {
-                    continue;
+                // Multicast: restrict to the target group. Unicast MCSP:
+                // any mapping is a candidate — the request is bound to
+                // a key, not a group.
+                if let Some(gid) = dst_group_id {
+                    if map_entry.group_id != gid {
+                        continue;
+                    }
                 }
 
                 let Some(key_set_entry) = fabric.groups().key_set_get(map_entry.group_key_set_id)
@@ -946,6 +1342,7 @@ impl Sessions {
 
                 for epoch_key_entry in key_set_entry.epoch_keys.iter() {
                     let mut temp_key_set = KeySet::new();
+
                     if temp_key_set
                         .update(
                             &crypto,
@@ -958,6 +1355,7 @@ impl Sessions {
                     }
 
                     let op_key_ref = temp_key_set.op_key();
+
                     let Ok(session_id) = derive_group_session_id(&crypto, op_key_ref) else {
                         continue;
                     };
@@ -965,6 +1363,8 @@ impl Sessions {
                     if session_id != expected_sess_id {
                         continue;
                     }
+
+                    key_attempted = true;
 
                     if let Some(payload_range) = Self::try_group_decrypt(
                         &crypto,
@@ -974,7 +1374,18 @@ impl Sessions {
                         op_key_ref,
                         src_nodeid,
                     ) {
-                        group_key_found = Some((fab_idx, payload_range));
+                        // Copy the op key so it survives past `temp_key_set`.
+                        let mut op_key_owned = crate::crypto::AEAD_KEY_ZEROED;
+                        op_key_owned.load(op_key_ref);
+                        let effective_group_id = dst_group_id.unwrap_or(map_entry.group_id);
+                        group_key_found = Some(GroupKeyFound {
+                            fab_idx,
+                            group_id: effective_group_id,
+                            fabric_node_id,
+                            op_key: op_key_owned,
+                            payload_range,
+                        });
+
                         break 'outer;
                     }
                 }
@@ -983,28 +1394,48 @@ impl Sessions {
 
         if group_key_found.is_none() {
             debug!(
-                "Group: No key could decrypt the message (SID=0x{:04x}, GRP=0x{:04x})",
-                expected_sess_id, group_id
+                "Group: No key could decrypt the message (SID=0x{:04x}, GRP={:?}, DSTU={:?})",
+                expected_sess_id, dst_group_id, dst_unicast_nodeid
             );
         }
 
-        let (fab_idx, payload_range) = group_key_found.ok_or(ErrorCode::NoSession)?;
+        // `NoSession` = no candidate key was available for this message;
+        // `InvalidSignature` = candidate key(s) matched the group session ID
+        // but none authenticated the message. The distinction feeds the
+        // `GroupcastTesting` event's result field (`NoAvailableKey` vs
+        // `FailedAuth`).
+        let GroupKeyFound {
+            fab_idx,
+            group_id,
+            fabric_node_id,
+            op_key,
+            payload_range,
+        } = group_key_found.ok_or(if key_attempted {
+            ErrorCode::InvalidSignature
+        } else {
+            ErrorCode::NoSession
+        })?;
 
-        // Validate group message counter before creating the session
-        if !self
-            .group_ctr_store
-            .post_recv(fab_idx.get(), src_nodeid, msg_ctr)
+        // Only data messages participate in this dedup: control
+        // messages (`C = 1`) live on a separate control-counter space
+        // that we don't track yet, and are trust-first regardless.
+        if !is_control
+            && !self
+                .group_ctr_store
+                .post_recv(fab_idx.get(), src_nodeid, msg_ctr)
         {
             debug!(
                 "Group: Duplicate message counter {} from node 0x{:016x} fab_idx={}",
                 msg_ctr, src_nodeid, fab_idx
             );
+
             return Err(ErrorCode::Duplicate.into());
         }
 
         // Create ephemeral group session
         let peer = packet.peer;
         let mut rand = crypto.weak_rand()?;
+
         let session = match self.add(rand.next_u32(), false, peer, Some(src_nodeid), dev_det) {
             Ok(session) => session,
             Err(_) => {
@@ -1018,8 +1449,20 @@ impl Sessions {
                 }
             }
         };
+
         session.set_session_mode(SessionMode::Group { fab_idx, group_id });
         session.local_sess_id = expected_sess_id;
+        // Mirror the group session id onto the peer side so `pre_send`
+        // emits the correct value when we reply.
+        session.peer_sess_id = expected_sess_id;
+        // Group sessions always emit their Source Node ID, so `pre_send`
+        // needs this set to our identity for the matching fabric.
+        session.set_local_nodeid(fabric_node_id);
+        // Keep the operational key on the session so downstream
+        // handlers (e.g. MCSP responder) can encrypt the reply with the
+        // same key that decrypted the request.
+        session.dec_key.load(op_key.reference());
+        session.enc_key.load(op_key.reference());
 
         debug!(
             "Group: Created group session for fab_idx={}, group_id=0x{:04x}, src_nodeid=0x{:016x}",
@@ -1067,7 +1510,9 @@ impl Sessions {
             None
         }
     }
+}
 
+impl Sessions {
     pub fn get_next_sess_id(&mut self) -> u16 {
         let mut next_sess_id: u16;
         loop {
@@ -1091,7 +1536,19 @@ impl Sessions {
         next_sess_id
     }
 
-    pub fn get_next_exch_id(&mut self) -> u16 {
+    pub fn get_next_exch_id<C: Crypto>(&mut self, crypto: C) -> Result<u16, Error> {
+        if self.next_exch_id == 0 {
+            // Per the Matter Core spec, the first exchange ID of an initiator
+            // node must be a random integer, with all subsequent ones
+            // incrementing by one. Seeding is lazy because the constructors
+            // have no access to an RNG (`Sessions::new` is `const`).
+            //
+            // `0` is unambiguous as the "not seeded yet" sentinel, because the
+            // counter below never assumes that value.
+            let candidate = crypto.rand()?.next_u32() as u16;
+            self.next_exch_id = if candidate == 0 { 1 } else { candidate };
+        }
+
         let mut next_exch_id: u16;
         loop {
             next_exch_id = self.next_exch_id;
@@ -1115,7 +1572,8 @@ impl Sessions {
                 break;
             }
         }
-        next_exch_id
+
+        Ok(next_exch_id)
     }
 
     pub fn get_session_for_eviction(&mut self) -> Option<&mut Session> {
@@ -1252,12 +1710,17 @@ impl Sessions {
         // limits) over UDP when both are available for the same peer. This
         // is required e.g. for the WebRTC Transport Provider's outbound
         // `Answer(sdp)` invoke whose payload can easily exceed a UDP MTU.
+        //
+        // Among sessions of the same transport, prefer the most recently used
+        // one: when several CASE sessions to the same peer exist, the freshest
+        // is the one the peer is actually communicating on, so reports and other
+        // outbound traffic reach the session it is listening on.
         let idx = self
             .sessions
             .iter()
             .enumerate()
             .filter(|(_, s)| !s.expired && s.is_for_node(fabric_idx, peer_node_id))
-            .max_by_key(|(_, s)| i32::from(s.peer_addr.is_tcp()))
+            .max_by_key(|(_, s)| (s.peer_addr.is_tcp(), s.last_use))
             .map(|(i, _)| i)?;
 
         let session = &mut self.sessions[idx];

@@ -17,7 +17,7 @@
 
 use core::fmt;
 
-use super::{Cluster, ClusterId, DeviceType, EndptId};
+use super::{Cluster, ClusterId, DeviceType, EndptId, SemanticTag};
 
 /// A type modeling the endpoint meta-data in the Matter data model.
 #[derive(Debug, Clone)]
@@ -43,6 +43,28 @@ pub struct Endpoint<'a> {
     /// surface of its own — see Matter Core spec for the
     /// `Descriptor::ClientList` semantics.
     pub client_clusters: &'a [ClusterId],
+    /// The endpoint's unique ID, advertised via
+    /// `Descriptor::EndpointUniqueID`. `None` by default.
+    ///
+    /// A manufacturer-assigned string (at most 32 bytes) that identifies this
+    /// endpoint uniquely within the node, so that machine-to-machine
+    /// integrations can keep addressing "the same" endpoint even if endpoint
+    /// IDs get renumbered across software updates or bridge re-compositions.
+    ///
+    /// Populating this also requires the endpoint's `Descriptor` metadata to
+    /// advertise the optional `EndpointUniqueID` attribute - see
+    /// [`crate::dm::clusters::desc::CLUSTER_ENDPOINT_UNIQUE_ID`].
+    pub unique_id: Option<&'a str>,
+    /// The semantic tags describing this endpoint, advertised via
+    /// `Descriptor::TagList`. Empty by default.
+    ///
+    /// These are only *required* when the node exposes several endpoints with
+    /// the same device type under one parent: Matter Core spec 9.5 then demands
+    /// that each carries a non-empty, mutually distinct `TagList` so the
+    /// endpoints can be told apart. Populating this also requires the endpoint's
+    /// `Descriptor` metadata to advertise the `TagList` feature and attribute -
+    /// see [`crate::dm::clusters::desc::CLUSTER_TAG_LIST`].
+    pub semantic_tags: &'a [SemanticTag<'a>],
 }
 
 impl<'a> Endpoint<'a> {
@@ -60,6 +82,8 @@ impl<'a> Endpoint<'a> {
             device_types,
             clusters,
             client_clusters: &[],
+            unique_id: None,
+            semantic_tags: &[],
         }
     }
 
@@ -76,6 +100,44 @@ impl<'a> Endpoint<'a> {
             device_types,
             clusters,
             client_clusters,
+            unique_id: None,
+            semantic_tags: &[],
+        }
+    }
+
+    /// Return this endpoint with the given semantic tags attached, to be
+    /// advertised via `Descriptor::TagList`.
+    ///
+    /// The endpoint's `Descriptor` cluster metadata must also advertise the
+    /// attribute and feature - use
+    /// [`crate::dm::clusters::desc::CLUSTER_TAG_LIST`] in place of the default
+    /// `DescHandler::CLUSTER`, otherwise the tags are never reported.
+    pub const fn with_tags(self, semantic_tags: &'a [SemanticTag<'a>]) -> Self {
+        Self {
+            id: self.id,
+            device_types: self.device_types,
+            clusters: self.clusters,
+            client_clusters: self.client_clusters,
+            unique_id: self.unique_id,
+            semantic_tags,
+        }
+    }
+
+    /// Return this endpoint with the given unique ID attached, to be
+    /// advertised via `Descriptor::EndpointUniqueID`.
+    ///
+    /// The endpoint's `Descriptor` cluster metadata must also advertise the
+    /// attribute - use
+    /// [`crate::dm::clusters::desc::CLUSTER_ENDPOINT_UNIQUE_ID`] in place of
+    /// the default `DescHandler::CLUSTER`, otherwise the ID is never reported.
+    pub const fn with_unique_id(self, unique_id: &'a str) -> Self {
+        Self {
+            id: self.id,
+            device_types: self.device_types,
+            clusters: self.clusters,
+            client_clusters: self.client_clusters,
+            unique_id: Some(unique_id),
+            semantic_tags: self.semantic_tags,
         }
     }
 
