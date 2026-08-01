@@ -20,16 +20,27 @@
 //! (`SubscribePrimingChunk::complete` →
 //! [`SubscribeOutcome::Established`]).
 
+use core::num::NonZeroU8;
+
 use embassy_futures::block_on;
 use embassy_futures::select::select;
 
-use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
-use rs_matter::im::{AttrPath, GenericPath};
+use rs_matter::dm::clusters::app::on_off::{
+    self, test::TestOnOffDeviceLogic, ClusterAsyncHandler as _, NoLevelControl,
+};
+use rs_matter::im::client::{ImClient, SubscribeOutcome, SubscriptionReportChunk, TxOutcome};
+use rs_matter::im::{AttrPath, CmdDataTag, GenericPath};
+use rs_matter::tlv::{TLVTag, TLVWrite};
+use rs_matter::transport::exchange::Exchange;
 use rs_matter::utils::select::Coalesce;
 
 use crate::common::e2e::im::echo_cluster;
-use crate::common::e2e::new_default_runner;
+use crate::common::e2e::{new_default_runner, E2eRunner};
 use crate::common::init_env_logger;
+
+fn remote_peer_id<C: rs_matter::crypto::Crypto>(_: &E2eRunner<C>) -> u64 {
+    E2eRunner::<C>::REMOTE_PEER_ID
+}
 
 /// `SubscribeSender::tx` + priming-chunk loop + terminal
 /// `SubscribeEstablished`. Mirrors `test_client_read_sender_non_chunked`
@@ -109,6 +120,128 @@ fn test_client_subscribe_sender_non_chunked() {
                 established.max_int >= 40,
                 "Server should clamp max_int to at least 40s (saw {})",
                 established.max_int
+            );
+
+            Ok(())
+        })
+        .coalesce(),
+    )
+    .unwrap()
+}
+
+/// Establish a subscription, mutate a standard cluster through another
+/// Interaction Model transaction, and consume the resulting server-initiated
+/// report exchange.
+#[test]
+fn test_client_subscription_active_report() {
+    init_env_logger();
+
+    let im = new_default_runner();
+    im.add_default_acl();
+    let handler = im.handler();
+
+    block_on(
+        select(im.run(handler), async {
+            let cluster_id =
+                on_off::OnOffHandler::<'_, TestOnOffDeviceLogic, NoLevelControl>::CLUSTER.id;
+            let attr_id = on_off::AttributeId::OnOff as u32;
+
+            let exchange = im.initiate_exchange().await?;
+            let mut sender = exchange.subscribe_sender().await?;
+            let paths = [AttrPath::from_gp(&GenericPath::new(
+                Some(1),
+                Some(cluster_id),
+                Some(attr_id),
+            ))];
+
+            let mut chunk = loop {
+                match sender.tx().await? {
+                    TxOutcome::BuildRequest(builder) => {
+                        sender = builder
+                            .keep_subs(true)?
+                            .min_int_floor(0)?
+                            .max_int_ceil(60)?
+                            .attr_requests_from(&paths)?
+                            .fabric_filtered(false)?
+                            .end()?;
+                    }
+                    TxOutcome::GotResponse(chunk) => break chunk,
+                }
+            };
+
+            let established = loop {
+                match chunk.complete().await? {
+                    SubscribeOutcome::NextChunk(next) => chunk = next,
+                    SubscribeOutcome::Established(established) => break established,
+                }
+            };
+
+            assert_eq!(established.peer.fabric_index, NonZeroU8::new(1).unwrap());
+            assert_eq!(established.peer.node_id, remote_peer_id(&im));
+
+            let exchange = im.initiate_exchange().await?;
+            let mut sender = exchange.invoke_sender(None).await?;
+            let mut invoke_chunk = loop {
+                match sender.tx().await? {
+                    TxOutcome::BuildRequest(builder) => {
+                        sender = builder
+                            .suppress_response(false)?
+                            .timed_request(false)?
+                            .invoke_requests()?
+                            .push()?
+                            .path(1, cluster_id, on_off::CommandId::On as u32)?
+                            .data(|w| w.u8(&TLVTag::Context(CmdDataTag::Data as u8), 1))?
+                            .end()?
+                            .end()?
+                            .end()?;
+                    }
+                    TxOutcome::GotResponse(chunk) => break chunk,
+                }
+            };
+
+            if !invoke_chunk.is_status_only() {
+                let response = invoke_chunk
+                    .response()?
+                    .expect("non-status-only invoke must have a response");
+                let mut statuses = response.statuses(cluster_id, on_off::CommandId::On as u32);
+                let (endpoint, status) = statuses.next().expect("On command status");
+                assert_eq!(endpoint, 1);
+                status?;
+            }
+
+            while let Some(next) = invoke_chunk.complete().await? {
+                invoke_chunk = next;
+            }
+
+            let exchange = Exchange::accept(im.matter_client()).await?;
+            let mut report = SubscriptionReportChunk::receive(exchange).await?;
+            assert!(report.matches(&established));
+            assert_eq!(report.peer(), established.peer);
+            assert_eq!(report.subscription_id(), established.subscription_id);
+
+            let mut report_chunks = 0;
+            let mut got_on = false;
+            loop {
+                report_chunks += 1;
+                {
+                    let response = report.response()?;
+                    for (endpoint, value) in response.attrs::<bool>(cluster_id, attr_id) {
+                        assert_eq!(endpoint, 1);
+                        assert!(value?);
+                        got_on = true;
+                    }
+                }
+
+                match report.complete().await? {
+                    Some(next) => report = next,
+                    None => break,
+                }
+            }
+
+            assert_eq!(report_chunks, 1);
+            assert!(
+                got_on,
+                "active report should contain the updated OnOff value"
             );
 
             Ok(())

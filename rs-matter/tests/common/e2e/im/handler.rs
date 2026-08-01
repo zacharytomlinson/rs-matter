@@ -26,8 +26,8 @@ use rs_matter::dm::devices::{DEV_TYPE_ON_OFF_LIGHT, DEV_TYPE_ROOT_NODE};
 use rs_matter::dm::endpoints::{EthSysHandler, EthSysHandlerBuilder, ROOT_ENDPOINT_ID};
 use rs_matter::dm::{
     Async, AsyncHandler, ChainedHandler, Dataver, EmptyHandler, Endpoint, EpClMatcher,
-    HandlerContext, InvokeContext, InvokeReply, LifecycleOp, MatchContext, Metadata, Node,
-    ReadContext, ReadReply, WriteContext,
+    HandlerContext, InvokeContext, InvokeReply, MatchContext, Metadata, Node, ReadContext,
+    ReadReply, WriteContext,
 };
 use rs_matter::error::Error;
 use rs_matter::{clusters, handler_chain_type};
@@ -127,8 +127,8 @@ impl<'a, OH: OnOffHooks, LH: LevelControlHooks> AsyncHandler for E2eTestHandler<
         self.0.bump_dataver(ctx)
     }
 
-    fn lifecycle(&self, ctx: impl HandlerContext, op: LifecycleOp) -> Result<(), Error> {
-        self.0.lifecycle(ctx, op)
+    async fn run(&self, ctx: impl HandlerContext) -> Result<(), Error> {
+        self.0.run(ctx).await
     }
 }
 
