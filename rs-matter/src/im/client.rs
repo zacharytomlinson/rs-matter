@@ -21,11 +21,10 @@
 //! (Read, Write, Invoke, Subscribe) to Matter devices and processing their
 //! responses.
 //!
-//! Subscribe support covers the `SubscribeRequest`, priming
-//! `ReportData` chunks and terminal `SubscribeResponse`, plus
-//! processing server-initiated post-establishment reports once the
-//! application accepts and dispatches their exchanges to
-//! [`SubscriptionReportChunk`].
+//! Subscribe support here covers the `SubscribeRequest`, priming
+//! `ReportData` chunks and terminal `SubscribeResponse`. Active
+//! reports are routed by [`crate::im::InteractionModel`] to a
+//! [`crate::dm::ReportDataHandler`].
 
 use core::num::NonZeroU8;
 use either::Either;
@@ -38,11 +37,12 @@ use crate::tlv::TLVWriteParent;
 use crate::tlv::{FromTLV, TLVBuilderParent, TLVElement, TLVTag, TLVWrite, TagType, ToTLV};
 use crate::transport::exchange::{Exchange, OwnedSender, OwnedSenderTx};
 use crate::transport::session::SessionMode;
+#[cfg(feature = "groups")]
+use crate::utils::storage::WriteBuf;
 
 use super::{
     IMStatusCode, InvReqBuilder, InvokeResp, OpCode, ReadReqBuilder, ReportDataResp, StatusResp,
     SubscribeReqBuilder, SubscribeResp, TimedReq, WriteReqBuilder, WriteResp, IM_REVISION,
-    PROTO_ID_INTERACTION_MODEL,
 };
 
 /// IM Client trait — extension over an [`Exchange`] that adds the
@@ -266,12 +266,12 @@ pub trait ImClient<'a>: Sized + Into<Exchange<'a>> {
     /// # Scope: establishment only
     ///
     /// The *active* subscription phase uses server-initiated
-    /// `ReportData` messages arriving on new exchanges. The
-    /// application accepts and dispatches those exchanges, then
-    /// passes each matching exchange to
-    /// [`SubscriptionReportChunk::receive`]. Once
-    /// [`SubscribeEstablished`] is returned, its peer and
-    /// subscription ID identify those future reports.
+    /// `ReportData` messages arriving on new exchanges. Configure an
+    /// [`crate::im::InteractionModel`] with
+    /// [`crate::im::InteractionModel::new_with_reports`] to route
+    /// those messages to a [`crate::dm::ReportDataHandler`]. Use
+    /// [`SubscribeEstablished::matches`] to associate its
+    /// [`crate::dm::SubscriptionCtx`] with this establishment.
     async fn subscribe_with<B>(self, mut build: B) -> Result<SubscribePrimingChunk<'a>, Error>
     where
         B: FnMut(SubscribeReqBuilder<SubscribeSender<'a>>) -> Result<SubscribeSender<'a>, Error>,
@@ -1364,6 +1364,16 @@ pub struct SubscribeEstablished {
     pub max_int: u16,
 }
 
+impl SubscribeEstablished {
+    /// Whether a report-handler subscription context belongs to this
+    /// established subscription.
+    pub fn matches(&self, subscription: &crate::dm::SubscriptionCtx) -> bool {
+        self.peer.fabric_index == subscription.fabric_idx
+            && self.peer.node_id == subscription.peer_node_id
+            && subscription.subscription_id == Some(self.subscription_id)
+    }
+}
+
 /// Authenticated peer identity associated with an operational CASE
 /// session. Subscription IDs are scoped by this identity.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -1373,121 +1383,6 @@ pub struct SubscriptionPeer {
     pub fabric_index: NonZeroU8,
     /// Operational node identifier authenticated by the CASE session.
     pub node_id: u64,
-}
-
-/// One chunk of a post-establishment subscription report received on
-/// a server-initiated exchange.
-///
-/// Applications remain responsible for accepting and dispatching
-/// responder exchanges. Pass an Interaction Model `ReportData`
-/// exchange to [`Self::receive`], inspect its borrowed response, and
-/// then call [`Self::complete`] to acknowledge it and advance through
-/// any remaining chunks.
-pub struct SubscriptionReportChunk<'a> {
-    exchange: Exchange<'a>,
-    peer: SubscriptionPeer,
-    subscription_id: u32,
-}
-
-impl core::fmt::Debug for SubscriptionReportChunk<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SubscriptionReportChunk")
-            .field("peer", &self.peer)
-            .field("subscription_id", &self.subscription_id)
-            .finish()
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for SubscriptionReportChunk<'_> {
-    fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(
-            f,
-            "SubscriptionReportChunk {{ peer: {:?}, subscription_id: {} }}",
-            self.peer,
-            self.subscription_id
-        )
-    }
-}
-
-impl<'a> SubscriptionReportChunk<'a> {
-    /// Receive and validate the first report chunk on an already
-    /// accepted responder exchange.
-    pub async fn receive(mut exchange: Exchange<'a>) -> Result<Self, Error> {
-        let peer = subscription_peer(&exchange)?;
-        exchange.recv_fetch().await?;
-        let subscription_id = subscription_report_id(&exchange, None)?;
-
-        Ok(Self {
-            exchange,
-            peer,
-            subscription_id,
-        })
-    }
-
-    /// Authenticated peer that sent this report.
-    pub const fn peer(&self) -> SubscriptionPeer {
-        self.peer
-    }
-
-    /// Subscription identifier carried by this report.
-    pub const fn subscription_id(&self) -> u32 {
-        self.subscription_id
-    }
-
-    /// Whether this report belongs to an established subscription.
-    pub fn matches(&self, established: &SubscribeEstablished) -> bool {
-        self.peer == established.peer && self.subscription_id == established.subscription_id
-    }
-
-    /// Borrowed access to the parsed `ReportData` in this chunk.
-    pub fn response(&self) -> Result<ReportDataResp<'_>, Error> {
-        report_data_response(&self.exchange)
-    }
-
-    /// Acknowledge the current report chunk and fetch the next one
-    /// when `more_chunks` is set. Returns `None` after the final
-    /// chunk has been acknowledged.
-    pub async fn complete(mut self) -> Result<Option<Self>, Error> {
-        let (more_chunks, suppress_response) = {
-            let response = self.response()?;
-            (
-                response.more_chunks.unwrap_or(false),
-                response.suppress_response.unwrap_or(false),
-            )
-        };
-
-        if more_chunks {
-            if suppress_response {
-                send_abort(&mut self.exchange).await?;
-                return Err(ErrorCode::InvalidData.into());
-            }
-
-            self.exchange
-                .send_with(|_, wb| {
-                    StatusResp::write(wb, IMStatusCode::Success)?;
-                    Ok(Some(OpCode::StatusResponse.into()))
-                })
-                .await?;
-            self.exchange.recv_fetch().await?;
-            subscription_report_id(&self.exchange, Some(self.subscription_id))?;
-
-            Ok(Some(self))
-        } else {
-            if !suppress_response {
-                self.exchange
-                    .send_with(|_, wb| {
-                        StatusResp::write(wb, IMStatusCode::Success)?;
-                        Ok(Some(OpCode::StatusResponse.into()))
-                    })
-                    .await?;
-            } else {
-                self.exchange.acknowledge().await?;
-            }
-
-            Ok(None)
-        }
-    }
 }
 
 // =====================================================================
@@ -1516,28 +1411,6 @@ fn subscription_peer(exchange: &Exchange<'_>) -> Result<SubscriptionPeer, Error>
             node_id,
         })
     })
-}
-
-fn report_data_response<'a>(exchange: &'a Exchange<'_>) -> Result<ReportDataResp<'a>, Error> {
-    let rx = exchange.rx()?;
-    let meta = rx.meta();
-    if meta.proto_id != PROTO_ID_INTERACTION_MODEL {
-        return Err(ErrorCode::InvalidProto.into());
-    }
-    check_opcode(meta.proto_opcode, OpCode::ReportData)?;
-
-    ReportDataResp::from_tlv(&TLVElement::new(rx.payload()))
-}
-
-fn subscription_report_id(exchange: &Exchange<'_>, expected: Option<u32>) -> Result<u32, Error> {
-    let subscription_id = report_data_response(exchange)?
-        .subscription_id
-        .ok_or(ErrorCode::InvalidData)?;
-    if expected.is_some_and(|expected| expected != subscription_id) {
-        return Err(ErrorCode::InvalidData.into());
-    }
-
-    Ok(subscription_id)
 }
 
 /// Send a timed-request handshake and wait for `StatusResponse(Success)`.
