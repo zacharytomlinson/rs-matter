@@ -33,7 +33,7 @@ use embassy_futures::select::{select, Either};
 use rs_matter::dm::clusters::net_comm::{DummyNetworks, NetworkType};
 use rs_matter::dm::networks::wireless::NoopWirelessNetCtl;
 use rs_matter::dm::{EmptyHandler, Node, ReportContext, ReportDataHandler, SubscriptionCtx};
-use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
+use rs_matter::im::client::{ImClient, SubscribeEstablished, SubscribeOutcome, TxOutcome};
 use rs_matter::im::encoding::ReportDataResp;
 use rs_matter::im::{
     AttrPath, GenericPath, IMStatusCode, InteractionModel, InteractionModelState, OpCode,
@@ -220,6 +220,7 @@ fn test_report_data_handler_catches_server_report() {
         Some(echo_cluster::AttributesDiscriminants::Att1 as u32),
     ));
     let paths = [path];
+    let established = Cell::<Option<SubscribeEstablished>>::new(None);
 
     // ---- Boot 1: subscribe and let the server persist the subscription. ----
     block_on(
@@ -244,7 +245,7 @@ fn test_report_data_handler_catches_server_report() {
                     }
                 };
 
-                let established = loop {
+                let subscription = loop {
                     let _ = chunk.response()?;
                     match chunk.complete().await? {
                         SubscribeOutcome::NextChunk(next) => chunk = next,
@@ -252,7 +253,8 @@ fn test_report_data_handler_catches_server_report() {
                     }
                 };
 
-                assert_ne!(established.subscription_id, 0);
+                assert_ne!(subscription.subscription_id, 0);
+                established.set(Some(subscription));
 
                 embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
 
@@ -323,5 +325,12 @@ fn test_report_data_handler_catches_server_report() {
     assert!(
         sub.subscription_id.is_some(),
         "the report should carry a subscription id"
+    );
+    assert!(
+        established
+            .get()
+            .expect("boot 1 should establish a subscription")
+            .matches(&sub),
+        "the report context should match the established subscription"
     );
 }
