@@ -1138,6 +1138,27 @@ impl<'a> Exchange<'a> {
             .await
     }
 
+    /// Open an exchange over a CASE session to a commissioned node at a known
+    /// operational address.
+    ///
+    /// An existing live session for `(fabric_idx, peer_node_id)` is reused. If
+    /// the peer has closed or expired that session, CASE is established at
+    /// `peer_addr` before an exchange is returned. No operational mDNS lookup
+    /// is performed.
+    #[inline(always)]
+    pub async fn initiate_at<C: Crypto>(
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+        peer_addr: network::Address,
+    ) -> Result<Self, Error> {
+        matter
+            .transport
+            .initiate_at(matter, crypto, fabric_idx, peer_node_id, peer_addr)
+            .await
+    }
+
     /// Open an exchange over a **PASE** session to a not-yet-commissioned node
     /// at the given peer address (use-case 2).
     ///
