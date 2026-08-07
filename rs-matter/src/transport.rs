@@ -736,6 +736,44 @@ impl Transport {
             .await
     }
 
+    /// Open an exchange over a live CASE session, establishing the session at
+    /// the supplied operational address when necessary.
+    pub(crate) async fn initiate_at<'a, C: Crypto>(
+        &self,
+        matter: &'a Matter<'a>,
+        crypto: C,
+        fabric_idx: NonZeroU8,
+        peer_node_id: NodeId,
+        peer_addr: Address,
+    ) -> Result<Exchange<'a>, Error> {
+        let existing = matter.with_state(|state| {
+            Ok::<_, Error>(
+                state
+                    .sessions
+                    .get_for_node(fabric_idx, peer_node_id)
+                    .map(|session| session.id),
+            )
+        })?;
+
+        if let Some(session_id) = existing {
+            return self.initiate_for_session(matter, crypto, session_id);
+        }
+
+        let exchange = self.initiate_plaintext(matter, &crypto, peer_addr).await?;
+        CaseInitiator::perform(exchange, &crypto, fabric_idx, peer_node_id).await?;
+
+        let session_id = matter.with_state(|state| {
+            state
+                .sessions
+                .get_for_node(fabric_idx, peer_node_id)
+                .map(|session| session.id)
+                .ok_or(ErrorCode::NoSession)
+                .map_err(Error::from)
+        })?;
+
+        self.initiate_for_session(matter, crypto, session_id)
+    }
+
     /// Establish a fresh CASE session to an already-commissioned peer (resolving
     /// its operational address over mDNS), then open an exchange on it. Called by
     /// [`initiate`](Self::initiate) only when no live session to the peer exists.
