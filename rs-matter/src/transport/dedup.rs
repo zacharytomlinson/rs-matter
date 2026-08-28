@@ -22,13 +22,27 @@ const MSG_RX_STATE_BITMAP_LEN: u32 = 16;
 pub struct RxCtrState {
     max_ctr: u32,
     ctr_bitmap: u16,
+    initialized: bool,
 }
 
 impl RxCtrState {
+    #[cfg(any(feature = "groups", test))]
     pub const fn new(max_ctr: u32) -> Self {
         Self {
             max_ctr,
             ctr_bitmap: 0xffff,
+            initialized: true,
+        }
+    }
+
+    /// Create receive-counter state before any counter from this peer has
+    /// arrived. The first packet establishes `max_ctr` without pretending that
+    /// the preceding replay-window counters were already observed.
+    pub const fn new_uninitialized() -> Self {
+        Self {
+            max_ctr: 0,
+            ctr_bitmap: 0,
+            initialized: false,
         }
     }
 
@@ -51,6 +65,13 @@ impl RxCtrState {
     /// - `true` (group): modular comparison — a counter is forward
     ///   iff `(msg_ctr - max_ctr) mod 2^32` falls in `[1, 2^31 - 1]`, otherwise behind.
     pub fn post_recv(&mut self, msg_ctr: u32, is_encrypted: bool, with_rollover: bool) -> bool {
+        if !self.initialized {
+            self.max_ctr = msg_ctr;
+            self.ctr_bitmap = 0;
+            self.initialized = true;
+            return true;
+        }
+
         if msg_ctr == self.max_ctr {
             // Duplicate
             return false;
@@ -212,6 +233,16 @@ mod tests {
         assert_ndup(s.post_recv(119, NOT_ENCRYPTED, false));
         assert_ndup(s.post_recv(121, NOT_ENCRYPTED, false));
         assert_eq!(s.ctr_bitmap, 0b0100_0000_0000_0110);
+    }
+
+    #[test]
+    fn uninitialized_session_accepts_reordered_first_window() {
+        let mut s = RxCtrState::new_uninitialized();
+
+        assert_ndup(s.post_recv(102, NOT_ENCRYPTED, false));
+        assert_ndup(s.post_recv(103, NOT_ENCRYPTED, false));
+        assert_ndup(s.post_recv(101, NOT_ENCRYPTED, false));
+        assert_dup(s.post_recv(101, NOT_ENCRYPTED, false));
     }
 
     #[test]
