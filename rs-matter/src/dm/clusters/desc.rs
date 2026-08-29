@@ -201,7 +201,7 @@ impl ClusterHandler for DescHandler<'_> {
                 for dev_type in endpoint.device_types {
                     builder = builder
                         .push()?
-                        .device_type(dev_type.dtype as _)?
+                        .device_type(dev_type.dtype)?
                         .revision(dev_type.drev)?
                         .end()?;
                 }
@@ -214,7 +214,7 @@ impl ClusterHandler for DescHandler<'_> {
                 };
 
                 builder
-                    .device_type(dev_type.dtype as _)?
+                    .device_type(dev_type.dtype)?
                     .revision(dev_type.drev)?
                     .end()
             }

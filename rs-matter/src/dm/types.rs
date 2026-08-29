@@ -46,8 +46,23 @@ pub use crate::im::encoding::types::*;
 #[derive(Debug, ToTLV, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceType {
-    pub dtype: u16,
+    pub dtype: u32,
     pub drev: u16,
+}
+
+#[cfg(test)]
+mod device_type_tests {
+    use super::DeviceType;
+
+    #[test]
+    fn manufacturer_extensible_device_type_retains_its_vendor_prefix() {
+        let device_type = DeviceType {
+            dtype: 0xfff1_1001,
+            drev: 1,
+        };
+
+        assert_eq!(device_type.dtype, 0xfff1_1001);
+    }
 }
 
 /// A semantic tag describing an endpoint, as reported by

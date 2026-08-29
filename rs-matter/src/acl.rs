@@ -978,7 +978,7 @@ impl AclEntry {
                         Some(dt) => object
                             .device_types
                             .iter()
-                            .any(|endpoint_dt| endpoint_dt.dtype as u32 == dt),
+                            .any(|endpoint_dt| endpoint_dt.dtype == dt),
                         None => true,
                     };
                     endpoint_match && cluster_match && device_type_match
