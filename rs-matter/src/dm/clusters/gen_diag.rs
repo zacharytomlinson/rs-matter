@@ -24,7 +24,7 @@ use core::num::NonZeroU8;
 use crate::dm::{ArrayAttributeRead, Cluster, Dataver, InvokeContext, ReadContext};
 use crate::error::{Error, ErrorCode};
 use crate::im::ImStats;
-use crate::tlv::{Nullable, Octets, TLVBuilder, TLVBuilderParent};
+use crate::tlv::{Nullable, Octets, TLVBuilder, TLVBuilderParent, ToTLVArrayBuilder, ToTLVBuilder};
 use crate::utils::epoch::MATTER_EPOCH_SECS;
 use crate::utils::sync::DynBase;
 use crate::with;
@@ -115,6 +115,12 @@ pub trait GenDiag: DynBase {
     /// Trigger a test event.
     /// Check the Matter Core spec for more info.
     fn test_event_trigger(&self, key: &[u8], trigger: u64) -> Result<(), Error>;
+
+    /// Iterate over the standard hardware faults that are currently active.
+    fn hardware_faults(
+        &self,
+        f: &mut dyn FnMut(HardwareFaultEnum) -> Result<(), Error>,
+    ) -> Result<(), Error>;
 }
 
 impl<T> GenDiag for &T
@@ -135,6 +141,13 @@ where
 
     fn test_event_trigger(&self, key: &[u8], trigger: u64) -> Result<(), Error> {
         (**self).test_event_trigger(key, trigger)
+    }
+
+    fn hardware_faults(
+        &self,
+        f: &mut dyn FnMut(HardwareFaultEnum) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        (**self).hardware_faults(f)
     }
 }
 
@@ -160,6 +173,13 @@ impl GenDiag for () {
 
     fn test_event_trigger(&self, _key: &[u8], _trigger: u64) -> Result<(), Error> {
         Err(ErrorCode::ConstraintError.into())
+    }
+
+    fn hardware_faults(
+        &self,
+        _f: &mut dyn FnMut(HardwareFaultEnum) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -225,8 +245,9 @@ impl ClusterHandler for GenDiagHandler<'_> {
         // cluster now is - so `TC_IDM_10_2` fails if it is absent. The IDL
         // renders it `optional` (it cannot express revision-conditional
         // conformance), hence it has to be listed explicitly here.
-        .with_attrs(with!(required; AttributeId::UpTime | AttributeId::DeviceLoadStatus))
-        .with_cmds(with!(CommandId::TestEventTrigger | CommandId::TimeSnapshot));
+        .with_attrs(with!(required; AttributeId::UpTime | AttributeId::DeviceLoadStatus | AttributeId::ActiveHardwareFaults))
+        .with_cmds(with!(CommandId::TestEventTrigger | CommandId::TimeSnapshot))
+        .with_events(with!(EventId::HardwareFaultChange));
 
     fn dataver(&self) -> u32 {
         self.dataver.get()
@@ -270,6 +291,40 @@ impl ClusterHandler for GenDiagHandler<'_> {
                 parent_builder
                     .take()
                     .ok_or_else(|| ErrorCode::ConstraintError.into())
+            }
+            ArrayAttributeRead::ReadNone(builder) => builder.end(),
+        }
+    }
+
+    fn active_hardware_faults<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: ArrayAttributeRead<
+            ToTLVArrayBuilder<P, HardwareFaultEnum>,
+            ToTLVBuilder<P, HardwareFaultEnum>,
+        >,
+    ) -> Result<P, Error> {
+        match builder {
+            ArrayAttributeRead::ReadAll(builder) => {
+                let mut builder = Some(builder);
+                self.diag.hardware_faults(&mut |fault| {
+                    builder = Some(builder.take().unwrap().push(&fault)?);
+                    Ok(())
+                })?;
+                builder.take().unwrap().end()
+            }
+            ArrayAttributeRead::ReadOne(index, builder) => {
+                let mut current = 0_u16;
+                let mut builder = Some(builder);
+                let mut parent = None;
+                self.diag.hardware_faults(&mut |fault| {
+                    if current == index {
+                        parent = Some(builder.take().unwrap().set(&fault)?);
+                    }
+                    current += 1;
+                    Ok(())
+                })?;
+                parent.ok_or_else(|| ErrorCode::ConstraintError.into())
             }
             ArrayAttributeRead::ReadNone(builder) => builder.end(),
         }
