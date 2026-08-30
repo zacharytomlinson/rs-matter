@@ -25,7 +25,7 @@ use core::pin::pin;
 
 use domain::base::Message;
 
-use embassy_futures::select::{select, select4};
+use embassy_futures::select::{select, select3, select4};
 use embassy_time::{Duration, Timer};
 
 use rand_core::RngCore;
@@ -57,7 +57,7 @@ mod query;
 mod respond;
 mod types;
 
-const MAX_SERVICES: usize = MAX_FABRICS + 1;
+const MAX_SERVICES: usize = (MAX_FABRICS + 1) * 2;
 
 /// A built-in mDNS responder for Matter, utilizing a custom mDNS protocol implementation.
 ///
@@ -166,6 +166,164 @@ impl BuiltinMdns {
         select4(&mut broadcast, &mut respond, &mut resolve, &mut browse)
             .coalesce()
             .await
+    }
+
+    /// Run one accessory-only responder for two co-hosted Matter nodes.
+    ///
+    /// Both nodes publish through one socket and send lock. Incoming queries
+    /// are evaluated against each node's own service set and expanded with the
+    /// corresponding node's identity, port, and transport buffers. Controller-
+    /// side browse/resolve is intentionally absent; use [`Self::run`] when the
+    /// local node initiates discovery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_dual_responder<S, R, C>(
+        &mut self,
+        send: S,
+        recv: R,
+        host: &Host<'_>,
+        ipv4_interface: Option<Ipv4Addr>,
+        ipv6_interface: Option<u32>,
+        first: &Matter<'_>,
+        second: &Matter<'_>,
+        crypto: C,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+        C: Crypto,
+    {
+        let send = IfMutex::new(send);
+        let mut broadcast = pin!(Self::dual_broadcast(
+            &send,
+            host,
+            ipv4_interface,
+            ipv6_interface,
+            first,
+            second,
+            &crypto,
+        ));
+        let mut respond = pin!(Self::dual_respond(
+            &send,
+            recv,
+            host,
+            ipv4_interface,
+            ipv6_interface,
+            first,
+            second,
+            &crypto,
+        ));
+
+        select(&mut broadcast, &mut respond).coalesce().await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dual_broadcast<S, C>(
+        send: &IfMutex<S>,
+        host: &Host<'_>,
+        ipv4_interface: Option<Ipv4Addr>,
+        ipv6_interface: Option<u32>,
+        first: &Matter<'_>,
+        second: &Matter<'_>,
+        crypto: C,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        C: Crypto,
+    {
+        let mut services = Vec::<MatterLocalService, MAX_SERVICES>::new();
+        loop {
+            for matter in [first, second] {
+                services.clear();
+                matter.mdns_services(|service| {
+                    services
+                        .push(service)
+                        .map_err(|_| Error::from(ErrorCode::ResourceExhausted))
+                })?;
+                for service in &services {
+                    let mut send = send.lock().await;
+                    Self::broadcast_one(
+                        &mut *send,
+                        host,
+                        service,
+                        false,
+                        ipv4_interface,
+                        ipv6_interface,
+                        matter,
+                        &crypto,
+                    )
+                    .await?;
+                }
+            }
+
+            let mut first_changed = pin!(first.transport().wait_mdns());
+            let mut second_changed = pin!(second.transport().wait_mdns());
+            let mut periodic = pin!(Timer::after(Duration::from_secs(30)));
+            select3(&mut first_changed, &mut second_changed, &mut periodic).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dual_respond<S, R, C>(
+        send: &IfMutex<S>,
+        mut recv: R,
+        host: &Host<'_>,
+        ipv4_interface: Option<Ipv4Addr>,
+        ipv6_interface: Option<u32>,
+        first: &Matter<'_>,
+        second: &Matter<'_>,
+        crypto: C,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+        C: Crypto,
+    {
+        let mut services = Vec::<MatterLocalService, MAX_SERVICES>::new();
+        loop {
+            recv.wait_available().await?;
+            let rx_buf = first.transport_rx_buffer();
+            let mut rx_buf = rx_buf.get().await.ok_or(ErrorCode::ResourceExhausted)?;
+            let (len, addr) = recv.recv_from(&mut *rx_buf).await?;
+            let packet = &rx_buf[..len];
+
+            let is_response = matches!(
+                Message::from_octets(packet).map(|message| message.header().flags().qr),
+                Ok(true)
+            );
+            if is_response {
+                if let Ok(Some(answer)) = parse_into_answer(packet, ipv6_interface) {
+                    for matter in [first, second] {
+                        matter.transport().try_deposit_mdns_resolve(&answer);
+                        matter.transport().try_deposit_mdns_browse(&answer);
+                    }
+                }
+                continue;
+            }
+
+            for matter in [first, second] {
+                services.clear();
+                matter.mdns_services(|service| {
+                    services
+                        .push(service)
+                        .map_err(|_| Error::from(ErrorCode::ResourceExhausted))
+                })?;
+                for service in &services {
+                    let mut send = send.lock().await;
+                    Self::respond_one(
+                        &mut *send,
+                        addr,
+                        packet,
+                        host,
+                        service,
+                        ipv4_interface,
+                        ipv6_interface,
+                        matter,
+                        &crypto,
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     /// MdnsLocalService [`Matter::resolve`] requests: pick up a pending resolve request
