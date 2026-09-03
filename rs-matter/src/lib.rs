@@ -29,6 +29,8 @@
 #![allow(clippy::uninlined_format_args)]
 #![recursion_limit = "1024"]
 
+use core::num::NonZeroU8;
+
 use crate::crypto::Crypto;
 use crate::dm::clusters::basic_info::{
     self, BasicInfoConfig, BasicInfoSettings, FULL_CLUSTER as BASIC_INFO_CLUSTER,
@@ -580,6 +582,21 @@ impl<'a> Matter<'a> {
             let mut state = state.borrow_mut();
             f(&mut state)
         })
+    }
+
+    /// Evict every live CASE session for one operational peer.
+    ///
+    /// Controllers use this after a transaction proves that the peer no longer
+    /// recognizes the cached session. The next outbound exchange then performs
+    /// a fresh CASE handshake without disturbing sessions for other nodes on
+    /// the same fabric.
+    pub fn evict_case_sessions(&self, fabric_idx: NonZeroU8, peer_node_id: u64) -> usize {
+        let removed =
+            self.with_state(|state| state.sessions.remove_for_node(fabric_idx, peer_node_id));
+        if removed > 0 {
+            self.transport().notify_session_removed();
+        }
+        removed
     }
 
     /// Return the Groupcast testing-mode bridge.

@@ -1650,6 +1650,19 @@ impl Sessions {
         }
     }
 
+    pub(crate) fn remove_for_node(&mut self, fabric_idx: NonZeroU8, peer_node_id: u64) -> usize {
+        let mut removed = 0;
+        while let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.is_for_node(fabric_idx, peer_node_id))
+        {
+            self.sessions.swap_remove(index);
+            removed += 1;
+        }
+        removed
+    }
+
     /// This assumes that the higher layer has taken care of doing anything required
     /// as per the spec before the sessions are removed or expired
     pub fn remove_for_fabric(&mut self, fabric_idx: NonZeroU8, expire_sess_id: Option<u32>) {
@@ -1936,6 +1949,25 @@ mod tests {
         assert_eq!(sm.get_next_sess_id(), 65534);
         assert_eq!(sm.get_next_sess_id(), 65535);
         assert_eq!(sm.get_next_sess_id(), 2);
+    }
+
+    #[test]
+    fn removes_only_case_sessions_for_the_requested_peer() {
+        let mut sessions = Sessions::new();
+        let fabric = NonZeroU8::new(1).unwrap();
+        for node_id in [7, 7, 8] {
+            let session = sessions
+                .add(0, false, Address::default(), Some(node_id), &TEST_DEV_DET)
+                .unwrap();
+            session.mode = SessionMode::Case {
+                fab_idx: fabric,
+                cat_ids: NocCatIds::default(),
+            };
+        }
+
+        assert_eq!(sessions.remove_for_node(fabric, 7), 2);
+        assert!(sessions.get_for_node(fabric, 7).is_none());
+        assert!(sessions.get_for_node(fabric, 8).is_some());
     }
 
     #[test]
