@@ -14,6 +14,11 @@ rust-version.workspace = true
 [features]
 default = ["os", "rustcrypto", "log"]
 
+# Retain the generated standard Matter cluster catalog for controllers that
+# resolve a node's advertised data model at runtime. Endpoint firmware can omit
+# this feature and dead-strip the controller-only catalog.
+data-model-catalog = []
+
 # Sizing
 
 # Number of fabrics.

@@ -35,7 +35,9 @@ mod parser;
 mod struct_in;
 mod struct_out;
 
-use crate::idl::parser::{Entities, Event, Struct, StructField};
+use crate::idl::parser::{Entities, Event, Struct};
+
+pub(crate) use crate::idl::parser::StructField;
 
 pub use parser::Idl;
 

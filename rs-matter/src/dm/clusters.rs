@@ -66,3 +66,39 @@ pub mod wifi_diag;
 pub mod decl {
     include!(concat!(env!("OUT_DIR"), "/clusters_generated.rs"));
 }
+
+#[cfg(all(test, feature = "data-model-catalog"))]
+mod catalog_tests {
+    use super::decl::{on_off, standard_cluster, STANDARD_CLUSTERS};
+
+    #[test]
+    fn generated_catalog_resolves_the_standard_on_off_surface() {
+        let on_off = standard_cluster(on_off::FULL_CLUSTER.id).unwrap();
+        assert_eq!(on_off.name, "OnOff");
+        assert_eq!(on_off.metadata.revision, 6);
+        assert!(STANDARD_CLUSTERS.len() > 100);
+        assert!(STANDARD_CLUSTERS
+            .windows(2)
+            .all(|pair| pair[0].id() < pair[1].id()));
+
+        let lighting = on_off
+            .features
+            .iter()
+            .find(|feature| feature.id == 1)
+            .unwrap();
+        assert_eq!(lighting.name, "Lighting");
+
+        let command = on_off
+            .command(on_off::CommandId::OnWithTimedOff as u32)
+            .unwrap();
+        assert_eq!(command.name, "OnWithTimedOff");
+        assert_eq!(command.input_type, Some("OnWithTimedOffRequest"));
+        assert_eq!(command.fields.len(), 3);
+        assert_eq!(command.fields[0].name, "onOffControl");
+        assert_eq!(command.fields[0].data_type, "OnOffControlBitmap");
+        assert_eq!(command.fields[1].name, "onTime");
+        assert_eq!(command.fields[1].data_type, "int16u");
+        assert_eq!(command.fields[2].name, "offWaitTime");
+        assert_eq!(command.fields[2].data_type, "int16u");
+    }
+}

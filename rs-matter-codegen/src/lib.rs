@@ -22,6 +22,9 @@
 
 use std::path::Path;
 
+use proc_macro2::{Ident, Literal, Span, TokenStream};
+use quote::quote;
+
 use idl::{cluster_content, globals, Idl, IdlGenerateContext, CSA_STANDARD_CLUSTERS_IDL_V1_6_0_0};
 
 // FIXME: With rust 1.92 the compiler emits an unused assignment lint, because
@@ -82,9 +85,12 @@ pub fn generate(rs_matter_crate: &str, dest_dir: &Path) {
 
     // Generate root module: globals + per-cluster mod declarations with #[path] attributes
     let globals_formatted = format_tokens(globals_code);
+    let catalog_formatted = format_tokens(standard_catalog(&idl, &cluster_files, rs_matter_crate));
 
     let mut root = String::from("// IDL-generated code (via build.rs):\n\n");
     root.push_str(&globals_formatted);
+    root.push('\n');
+    root.push_str(&catalog_formatted);
     root.push('\n');
 
     for (module_name, _file_path) in &cluster_files {
@@ -102,4 +108,153 @@ pub fn generate(rs_matter_crate: &str, dest_dir: &Path) {
     }
 
     std::fs::write(dest_dir.join("clusters_generated.rs"), root).unwrap();
+}
+
+fn standard_catalog(
+    idl: &Idl,
+    cluster_files: &[(String, String)],
+    rs_matter_crate: &str,
+) -> TokenStream {
+    let krate = Ident::new(rs_matter_crate, Span::call_site());
+    let mut catalog_clusters = idl.clusters.iter().zip(cluster_files).collect::<Vec<_>>();
+    catalog_clusters.sort_by_key(|(cluster, _)| cluster.code);
+    let clusters = catalog_clusters
+        .into_iter()
+        .map(|(cluster, (module_name, _))| {
+            let module = Ident::new(module_name, Span::call_site());
+            let name = Literal::string(&cluster.id);
+            let features = cluster
+                .entities
+                .bitmaps
+                .iter()
+                .find(|bitmap| bitmap.id == "Feature")
+                .into_iter()
+                .flat_map(|bitmap| &bitmap.entries)
+                .map(|entry| {
+                    let id = Literal::u64_unsuffixed(entry.code);
+                    let name = Literal::string(entry.id.strip_prefix('k').unwrap_or(&entry.id));
+                    quote!(#krate::dm::StandardElement::new(#id, #name))
+                });
+            let attributes = cluster.attributes.iter().map(|attribute| {
+                let field = standard_field(&attribute.field, &krate);
+                let read_only = attribute.is_read_only;
+                let write_only = attribute.is_write_only;
+                quote!(
+                    #krate::dm::StandardAttributeDescriptor {
+                        field: #field,
+                        read_only: #read_only,
+                        write_only: #write_only,
+                    }
+                )
+            });
+            let commands = cluster.commands.iter().map(|command| {
+                let id = Literal::u64_unsuffixed(command.code);
+                let name = Literal::string(&command.id);
+                let input_type = command.input.as_ref().map_or_else(
+                    || quote!(None),
+                    |input| {
+                        let input = Literal::string(input);
+                        quote!(Some(#input))
+                    },
+                );
+                let output_type = Literal::string(&command.output);
+                let fields = command
+                    .input
+                    .as_ref()
+                    .and_then(|input| {
+                        cluster
+                            .entities
+                            .structs
+                            .iter()
+                            .find(|structure| &structure.id == input)
+                    })
+                    .into_iter()
+                    .flat_map(|structure| &structure.fields)
+                    .map(|field| standard_field(field, &krate));
+                let timed = command.is_timed;
+                let fabric_scoped = command.is_fabric_scoped;
+                quote!(
+                    #krate::dm::StandardCommandDescriptor {
+                        id: #id,
+                        name: #name,
+                        input_type: #input_type,
+                        output_type: #output_type,
+                        fields: &[#(#fields),*],
+                        timed: #timed,
+                        fabric_scoped: #fabric_scoped,
+                    }
+                )
+            });
+            let events = cluster.events.iter().map(|event| {
+                let id = Literal::u64_unsuffixed(event.code);
+                let name = Literal::string(&event.id);
+                let fields = event
+                    .fields
+                    .iter()
+                    .map(|field| standard_field(field, &krate));
+                let fabric_scoped = event.is_fabric_sensitive;
+                quote!(
+                    #krate::dm::StandardEventDescriptor {
+                        id: #id,
+                        name: #name,
+                        fields: &[#(#fields),*],
+                        fabric_scoped: #fabric_scoped,
+                    }
+                )
+            });
+            quote!(
+                #krate::dm::StandardClusterDescriptor {
+                    name: #name,
+                    metadata: &#module::FULL_CLUSTER,
+                    features: &[#(#features),*],
+                    attributes: &[#(#attributes),*],
+                    commands: &[#(#commands),*],
+                    events: &[#(#events),*],
+                }
+            )
+        });
+
+    quote!(
+        #[cfg(feature = "data-model-catalog")]
+        pub static STANDARD_CLUSTERS: &[#krate::dm::StandardClusterDescriptor] = &[
+            #(#clusters),*
+        ];
+
+        #[cfg(feature = "data-model-catalog")]
+        pub fn standard_cluster(
+            id: #krate::dm::ClusterId,
+        ) -> Option<&'static #krate::dm::StandardClusterDescriptor> {
+            STANDARD_CLUSTERS
+                .binary_search_by_key(&id, |cluster| cluster.id())
+                .ok()
+                .map(|index| &STANDARD_CLUSTERS[index])
+        }
+    )
+}
+
+fn standard_field(field: &idl::StructField, krate: &Ident) -> TokenStream {
+    let id = Literal::u64_unsuffixed(field.field.code);
+    let name = Literal::string(&field.field.id);
+    let data_type = Literal::string(&field.field.data_type.name);
+    let list = field.field.data_type.is_list;
+    let maximum_length = field.field.data_type.max_length.map_or_else(
+        || quote!(None),
+        |maximum| {
+            let maximum = Literal::u64_unsuffixed(maximum);
+            quote!(Some(#maximum))
+        },
+    );
+    let optional = field.is_optional;
+    let nullable = field.is_nullable;
+    quote!(
+        #krate::dm::StandardFieldDescriptor {
+            id: #id,
+            name: #name,
+            data_type: #data_type,
+            list: #list,
+            maximum_length: #maximum_length,
+            optional: #optional,
+            nullable: #nullable,
+        }
+    )
 }

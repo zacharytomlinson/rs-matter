@@ -22,6 +22,12 @@ Users are free to consume all of the APIs, including the provided system cluster
 * ... or just using the shrink-wrapped [`rs-matter-stack`](https://github.com/sysgrok/rs-matter-stack) arrangement and its down-stream crates;
 * ... and so on.
 
+Controllers that resolve a node's advertised data model can enable the
+`data-model-catalog` feature. It exposes the generated standard-cluster catalog
+from the bundled CSA IDL: cluster, feature, attribute, command, event, and
+command-field identities and types. Endpoint firmware can leave the feature
+disabled so the controller-only catalog is not retained.
+
 ## I just want to run Matter on my MCU!
 
 * To run `rs-matter` on baremetal MCUs with [Embassy](https://github.com/embassy-rs/embassy), look at [`rs-matter-embassy`](https://github.com/sysgrok/rs-matter-embassy). Currently supported MCUs:
